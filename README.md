@@ -64,9 +64,9 @@ buffer is not required.
 
 - Every loaded model owns a dedicated worker thread. MNN interpreter/session
   handles never cross application threads, and destruction order is fixed.
-- `Model` is cloneable and can be called from any thread. Calls to one model are
-  processed in submission order.
-- The default `ExecutionMode::Serialized` uses one process-wide gate. This
+- `Model` is cloneable and can be called from any thread. Accepted calls to one model are processed in submission order. Each model has
+  a bounded queue (two waiting requests by default); saturation returns `QueueFull`.
+- The default `ExecutionMode::Serialized` uses one process-wide gate owned by the sys crate for model creation, inference, and destruction. This
   avoids oversubscription and global-state races when OCR and gaze run in the
   same process. `ExecutionMode::Parallel` is an explicit opt-in for measured
   workloads.
@@ -76,7 +76,8 @@ buffer is not required.
 ## Features
 
 The default build enables MNN's internal thread pool, static linking, verified
-prebuilt downloads, and CPU inference.
+prebuilt downloads where the ABI/CRT matches, and CPU inference. Windows builds
+using Rust's default dynamic CRT compile MNN from source with the same CRT.
 
 | Feature | Backend or behavior |
 | --- | --- |
@@ -89,7 +90,7 @@ prebuilt downloads, and CPU inference.
 | `opengl` | OpenGL |
 | `vulkan` | Vulkan |
 | `openmp` | OpenMP |
-| `crt-static` | Static C runtime on Windows |
+| `crt-static` | Require static CRT; also set `RUSTFLAGS="-C target-feature=+crt-static"` |
 
 Feature selection belongs to the final application. Libraries should normally
 declare `mnn-runtime` with `default-features = false`; the executable then
@@ -130,3 +131,48 @@ longer depends on mutable release state.
 ## License
 
 Apache-2.0. MNN and the upstream Rust bindings are also Apache-2.0.
+
+## Allocation and scheduling control
+
+`run_owned(inputs)` moves an existing `Vec<Tensor>` to the worker. `run_reusing`
+consumes previously returned output tensors and overwrites their allocations;
+outputs are selected by those tensors' names. Both consume their buffers on an
+error. Native host buffers are cached per model, with NC4HW4 converted to the
+public contiguous NCHW layout. `TensorInfo::is_channel_last()` identifies NHWC.
+
+```rust,no_run
+# use mnn_runtime::{Model, Tensor};
+# fn process(model: &Model, inputs: Vec<Tensor>, previous_outputs: Vec<Tensor>) -> mnn_runtime::Result<()> {
+let result = model.run_reusing(inputs, previous_outputs)?;
+println!("{:?}", result.timings);
+# Ok(()) }
+```
+
+`try_submit_owned(inputs, deadline)` returns a `PendingRun`. Dropping or cancelling
+that handle skips work that has not entered MNN; `wait_timeout` also cancels
+queued work on expiry. An active native inference cannot be interrupted. A
+superseded frame can be cancelled before submitting its replacement; cancelled
+queue entries are reclaimed by the worker, so retry after `QueueFull` rather
+than assuming cancellation immediately creates capacity. Dropping the last
+`Model` waits for worker shutdown.
+
+CPU thread counts must be 1..=32. MNN shares its internal pool: initialize the
+largest required multithreaded model first. A later request exceeding the
+existing pool returns `ThreadCountLimited` instead of silently reducing it.
+`ModelInfo::effective_threads()` exposes the actual CPU count (`None` for GPU).
+This checks the session configuration, not hardware utilization.
+
+`GpuTuning::Auto` uses Fast on OpenCL and None on Vulkan. Wide/Heavy tuning are
+explicit opt-ins; Fast/Normal are rejected for Vulkan. OpenCL defaults to Buffer
+storage to avoid 2D image limits on wide tensors. Other backends never receive
+OpenCL memory bits; CPU thread counts are not interpreted as GPU mode flags.
+
+Run `cargo run -p mnn-runtime --example overhead` for a tiny-model latency
+comparison. `RunTimings` separates queue/gate wait, upload, session execution,
+and download; GPU work can complete during download. Production optimization
+needs cold/warm runs, P50/P95/P99, RSS and allocation measurements on real models.
+
+For static OpenMP builds the build script links the compiler's runtime (`gomp`,
+`omp`, or `vcomp`); `MNN_OPENMP_LIB` overrides it for custom toolchains. GNU Linux
+prebuilt archives are never reused for musl. Intel iOS uses the simulator SDK;
+Catalyst currently requires an external MNN installation.

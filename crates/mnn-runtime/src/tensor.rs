@@ -7,11 +7,34 @@ use crate::{Error, Result};
 pub struct TensorInfo {
     name: String,
     shape: Vec<usize>,
+    element_count: usize,
+    channel_last: bool,
 }
 
 impl TensorInfo {
+    pub(crate) fn checked(name: String, shape: Vec<usize>, channel_last: bool) -> Result<Self> {
+        let element_count = shape
+            .iter()
+            .try_fold(1_usize, |n, &d| n.checked_mul(d))
+            .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::ShapeOverflow { name: name.clone() })?;
+        Ok(Self {
+            name,
+            shape,
+            element_count,
+            channel_last,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(name: String, shape: Vec<usize>) -> Self {
-        Self { name, shape }
+        Self::checked(name, shape, false).expect("test tensor shape")
+    }
+
+    /// Whether dimensions/values use channel-last order (NHWC for rank four).
+    #[must_use]
+    pub fn is_channel_last(&self) -> bool {
+        self.channel_last
     }
 
     /// Tensor name from the MNN graph.
@@ -29,7 +52,7 @@ impl TensorInfo {
     /// Number of `f32` elements in the tensor.
     #[must_use]
     pub fn element_count(&self) -> usize {
-        self.shape.iter().product()
+        self.element_count
     }
 }
 
@@ -86,6 +109,11 @@ impl Tensor {
     #[must_use]
     pub fn data(&self) -> &[f32] {
         &self.data
+    }
+
+    /// Mutate values while preserving the validated length and shape.
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        &mut self.data
     }
 
     /// Consume the tensor and return its contiguous values.

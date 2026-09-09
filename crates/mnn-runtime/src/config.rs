@@ -88,6 +88,36 @@ pub enum ExecutionMode {
     Parallel,
 }
 
+/// GPU kernel search policy. Fast/Normal are `OpenCL`-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuTuning {
+    /// Fast for `OpenCL`, no tuning for Vulkan.
+    #[default]
+    Auto,
+    /// Disable tuning.
+    None,
+    /// Search a small `OpenCL` candidate set.
+    Fast,
+    /// Search a medium `OpenCL` candidate set.
+    Normal,
+    /// Search a wide candidate set (slower first inference).
+    Wide,
+    /// Exhaustive tuning (slowest initialization).
+    Heavy,
+}
+
+/// `OpenCL` tensor storage; ignored by other backends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuMemoryMode {
+    /// Avoid device image-size limits for wide tensors.
+    #[default]
+    Buffer,
+    /// Use GPU images.
+    Image,
+    /// Let MNN choose.
+    Auto,
+}
+
 /// Configuration used for subsequently loaded models.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -103,6 +133,12 @@ pub struct RuntimeConfig {
     pub memory: MemoryMode,
     /// Cross-model execution policy.
     pub execution: ExecutionMode,
+    /// Maximum queued requests per model, excluding the active request.
+    pub queue_capacity: usize,
+    /// GPU tuning policy.
+    pub gpu_tuning: GpuTuning,
+    /// `OpenCL` storage policy.
+    pub gpu_memory: GpuMemoryMode,
 }
 
 impl Default for RuntimeConfig {
@@ -114,6 +150,9 @@ impl Default for RuntimeConfig {
             power: PowerMode::Normal,
             memory: MemoryMode::Normal,
             execution: ExecutionMode::Serialized,
+            queue_capacity: 2,
+            gpu_tuning: GpuTuning::Auto,
+            gpu_memory: GpuMemoryMode::Buffer,
         }
     }
 }
@@ -143,6 +182,27 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn with_precision(mut self, precision: PrecisionMode) -> Self {
         self.precision = precision;
+        self
+    }
+
+    /// Set the maximum number of queued requests (must be positive).
+    #[must_use]
+    pub const fn with_queue_capacity(mut self, capacity: usize) -> Self {
+        self.queue_capacity = capacity;
+        self
+    }
+
+    /// Select GPU tuning.
+    #[must_use]
+    pub const fn with_gpu_tuning(mut self, tuning: GpuTuning) -> Self {
+        self.gpu_tuning = tuning;
+        self
+    }
+
+    /// Select `OpenCL` tensor storage.
+    #[must_use]
+    pub const fn with_gpu_memory(mut self, memory: GpuMemoryMode) -> Self {
+        self.gpu_memory = memory;
         self
     }
 

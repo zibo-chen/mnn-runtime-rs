@@ -8,6 +8,7 @@
 #include <cstring>
 #include <exception>
 #include <map>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -25,6 +26,9 @@ struct MnnRuntimeEngine {
     std::vector<std::pair<std::string, MNN::Tensor *>> inputs;
     std::vector<std::pair<std::string, MNN::Tensor *>> outputs;
     std::string last_error;
+    std::vector<std::unique_ptr<MNN::Tensor>> input_hosts;
+    std::vector<std::unique_ptr<MNN::Tensor>> output_hosts;
+    int effective_threads = 0;
 
     ~MnnRuntimeEngine() {
         if (session != nullptr && interpreter != nullptr) {
@@ -79,21 +83,6 @@ const std::vector<std::pair<std::string, MNN::Tensor *>> *select_tensors(
     return input != 0 ? &engine->inputs : &engine->outputs;
 }
 
-MNN::Tensor *find_tensor(
-    std::vector<std::pair<std::string, MNN::Tensor *>> &tensors,
-    const uint8_t *name,
-    size_t name_length) {
-    if (name == nullptr) {
-        return nullptr;
-    }
-    const std::string key(reinterpret_cast<const char *>(name), name_length);
-    const auto found = std::find_if(
-        tensors.begin(),
-        tensors.end(),
-        [&key](const auto &tensor) { return tensor.first == key; });
-    return found == tensors.end() ? nullptr : found->second;
-}
-
 void configure_backend(MNN::BackendConfig &backend, const MnnRuntimeConfig &config) {
     backend.precision = static_cast<MNN::BackendConfig::PrecisionMode>(config.precision);
     backend.power = static_cast<MNN::BackendConfig::PowerMode>(config.power);
@@ -103,7 +92,7 @@ void configure_backend(MNN::BackendConfig &backend, const MnnRuntimeConfig &conf
 
 extern "C" {
 
-const char *mnn_runtime_version(void) { return MNN_VERSION; }
+const char *mnn_runtime_version(void) { return MNN::getVersion(); }
 
 int32_t mnn_runtime_backend_available(int32_t backend) {
     if (backend == MNN_FORWARD_AUTO) {
@@ -120,11 +109,15 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
     size_t model_size,
     const MnnRuntimeConfig *config) {
     creation_error.clear();
-    if (model == nullptr || model_size == 0 || config == nullptr || config->threads <= 0) {
+    if (model == nullptr || model_size == 0 || model_size > static_cast<size_t>(INT32_MAX) || config == nullptr || config->threads <= 0) {
         set_error(nullptr, "model bytes and a positive thread count are required");
         return nullptr;
     }
 
+    if (config->precision < 0 || config->precision > 3 || config->power < 0 || config->power > 2 || config->memory < 0 || config->memory > 2) {
+        set_error(nullptr, "invalid backend configuration enum");
+        return nullptr;
+    }
     try {
         auto engine = std::make_unique<MnnRuntimeEngine>();
         engine->interpreter.reset(MNN::Interpreter::createFromBuffer(model, model_size));
@@ -139,7 +132,11 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
         MNN::ScheduleConfig schedule;
         schedule.type = static_cast<MNNForwardType>(config->backend);
         schedule.backupType = MNN_FORWARD_CPU;
-        schedule.numThread = config->threads;
+        if (schedule.type == MNN_FORWARD_OPENCL || schedule.type == MNN_FORWARD_VULKAN) {
+            schedule.mode = config->gpu_mode;
+        } else {
+            schedule.numThread = config->threads;
+        }
         schedule.backendConfig = &backend_config;
 
         engine->session = engine->interpreter->createSession(schedule);
@@ -148,6 +145,16 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
             return nullptr;
         }
 
+        int resize_status = 0;
+        if (!engine->interpreter->getSessionInfo(engine->session, MNN::Interpreter::RESIZE_STATUS, &resize_status) || resize_status != 0) {
+            set_error(nullptr, "MNN session could not allocate/resize its tensors");
+            return nullptr;
+        }
+        int backends[2] = {-1, -1};
+        engine->interpreter->getSessionInfo(engine->session, MNN::Interpreter::BACKENDS, backends);
+        if (backends[0] == MNN_FORWARD_CPU) {
+            engine->interpreter->getSessionInfo(engine->session, MNN::Interpreter::THREAD_NUMBER, &engine->effective_threads);
+        }
         engine->inputs = tensor_list(engine->interpreter->getSessionInputAll(engine->session));
         engine->outputs = tensor_list(engine->interpreter->getSessionOutputAll(engine->session));
         if (engine->inputs.empty() || engine->outputs.empty()) {
@@ -166,6 +173,22 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
                 return nullptr;
             }
         }
+        for (const auto &entry : engine->inputs) {
+            if (logical_elements(entry.second) == 0 || logical_elements(entry.second) > INT32_MAX / sizeof(float)) {
+                set_error(nullptr, "input shape is dynamic or exceeds the native allocation limit");
+                return nullptr;
+            }
+            engine->input_hosts.emplace_back(new MNN::Tensor(entry.second, entry.second->getDimensionType()));
+        }
+        for (const auto &entry : engine->outputs) {
+            if (logical_elements(entry.second) == 0 || logical_elements(entry.second) > INT32_MAX / sizeof(float)) {
+                set_error(nullptr, "output shape is dynamic or exceeds the native allocation limit");
+                return nullptr;
+            }
+            engine->output_hosts.emplace_back(new MNN::Tensor(entry.second, entry.second->getDimensionType()));
+        }
+        // Static sessions own their weights/executions after successful creation.
+        engine->interpreter->releaseModel();
         return engine.release();
     } catch (const std::exception &error) {
         set_error(nullptr, error.what());
@@ -173,6 +196,16 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
         set_error(nullptr, "unknown exception while creating MNN engine");
     }
     return nullptr;
+}
+
+int32_t mnn_runtime_effective_threads(const MnnRuntimeEngine *engine) {
+    return engine == nullptr ? 0 : engine->effective_threads;
+}
+
+int32_t mnn_runtime_tensor_layout(const MnnRuntimeEngine *engine, int32_t input, size_t index) {
+    const auto *tensors = select_tensors(engine, input);
+    if (tensors == nullptr || index >= tensors->size()) return -1;
+    return (*tensors)[index].second->getDimensionType() == MNN::Tensor::TENSORFLOW ? 1 : 0;
 }
 
 void mnn_runtime_engine_destroy(MnnRuntimeEngine *engine) { delete engine; }
@@ -226,17 +259,16 @@ int32_t mnn_runtime_tensor_shape(
     return MNN_RUNTIME_OK;
 }
 
-int32_t mnn_runtime_write_input_f32(
+int32_t mnn_runtime_write_input_index_f32(
     MnnRuntimeEngine *engine,
-    const uint8_t *name,
-    size_t name_length,
+    size_t index,
     const float *data,
     size_t element_count) {
     if (engine == nullptr || data == nullptr) {
         return MNN_RUNTIME_INVALID_ARGUMENT;
     }
     try {
-        MNN::Tensor *device = find_tensor(engine->inputs, name, name_length);
+        MNN::Tensor *device = index < engine->inputs.size() ? engine->inputs[index].second : nullptr;
         if (device == nullptr) {
             set_error(engine, "input tensor not found");
             return MNN_RUNTIME_TENSOR_NOT_FOUND;
@@ -251,7 +283,7 @@ int32_t mnn_runtime_write_input_f32(
             return MNN_RUNTIME_SHAPE_ERROR;
         }
 
-        std::unique_ptr<MNN::Tensor> host(MNN::Tensor::createHostTensorFromDevice(device, false));
+        const auto &host = engine->input_hosts[index];
         if (host == nullptr || host->host<float>() == nullptr) {
             set_error(engine, "could not allocate host input tensor");
             return MNN_RUNTIME_COPY_ERROR;
@@ -291,17 +323,16 @@ int32_t mnn_runtime_run(MnnRuntimeEngine *engine) {
     return MNN_RUNTIME_INTERNAL_ERROR;
 }
 
-int32_t mnn_runtime_read_output_f32(
+int32_t mnn_runtime_read_output_index_f32(
     MnnRuntimeEngine *engine,
-    const uint8_t *name,
-    size_t name_length,
+    size_t index,
     float *data,
     size_t element_count) {
     if (engine == nullptr || data == nullptr) {
         return MNN_RUNTIME_INVALID_ARGUMENT;
     }
     try {
-        MNN::Tensor *device = find_tensor(engine->outputs, name, name_length);
+        MNN::Tensor *device = index < engine->outputs.size() ? engine->outputs[index].second : nullptr;
         if (device == nullptr) {
             set_error(engine, "output tensor not found");
             return MNN_RUNTIME_TENSOR_NOT_FOUND;
@@ -316,8 +347,12 @@ int32_t mnn_runtime_read_output_f32(
             return MNN_RUNTIME_SHAPE_ERROR;
         }
 
-        std::unique_ptr<MNN::Tensor> host(MNN::Tensor::createHostTensorFromDevice(device, true));
+        const auto &host = engine->output_hosts[index];
         if (host == nullptr || host->host<float>() == nullptr) {
+            set_error(engine, "MNN failed to copy the output tensor to host memory");
+            return MNN_RUNTIME_COPY_ERROR;
+        }
+        if (!device->copyToHostTensor(host.get())) {
             set_error(engine, "MNN failed to copy the output tensor to host memory");
             return MNN_RUNTIME_COPY_ERROR;
         }

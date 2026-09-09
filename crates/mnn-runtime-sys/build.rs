@@ -6,6 +6,9 @@ use std::{
     process::Command,
 };
 
+mod build_support;
+use build_support::{ios_sdk, target_suffix};
+
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
@@ -22,6 +25,7 @@ enum LinkMode {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-changed=cpp/mnn_runtime_bridge.cpp");
     println!("cargo:rerun-if-changed=cpp/mnn_runtime_bridge.h");
     for variable in [
@@ -32,6 +36,12 @@ fn main() {
         "MNN_PREBUILT_TAG",
         "MNN_PREBUILT_SHA256",
         "MNN_SOURCE_DIR",
+        "MNN_OPENMP_LIB",
+        "DOCS_RS",
+        "ANDROID_NDK_ROOT",
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK",
+        "NDK_HOME",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
@@ -54,6 +64,14 @@ fn main() {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let target = required_env("TARGET");
 
+    if cfg!(feature = "crt-static") && !target_crt_static() {
+        panic!(
+            "feature `crt-static` requires RUSTFLAGS='-C target-feature=+crt-static' so Rust and C++ use the same CRT"
+        );
+    }
+    if cfg!(feature = "openmp") && matches!(target_os.as_str(), "macos" | "ios") {
+        panic!("this MNN baseline does not support OpenMP on Apple targets");
+    }
     let has_prebuilt = prebuilt_compatible(&target_os)
         && target_suffix(&target_os, &target_arch, &target_env, &target).is_some();
     let (include_dir, lib_dir, prebuilt) = if let Some(external) = external_installation() {
@@ -95,7 +113,10 @@ fn prebuilt_compatible(target_os: &str) -> bool {
         || cfg!(feature = "opengl")
         || cfg!(feature = "vulkan")
         || cfg!(feature = "openmp");
-    metal_ok && !unsupported_backend
+    metal_ok
+        && !unsupported_backend
+        && cfg!(feature = "mnn-threadpool")
+        && (target_os != "windows" || target_crt_static())
 }
 
 fn acquire_prebuilt(os: &str, arch: &str, target_env: &str, target: &str) -> (PathBuf, PathBuf) {
@@ -128,7 +149,10 @@ fn acquire_prebuilt(os: &str, arch: &str, target_env: &str, target: &str) -> (Pa
 
     let extraction = out_dir.join("prebuilt");
     let root = extraction.join(&asset);
-    if !root.join("include/MNN/Interpreter.hpp").is_file() {
+    let stamp = extraction.join("archive.sha256");
+    if !root.join("include/MNN/Interpreter.hpp").is_file()
+        || fs::read_to_string(&stamp).ok().as_deref() != Some(&checksum)
+    {
         if extraction.exists() {
             fs::remove_dir_all(&extraction).expect("failed to clear partial MNN extraction");
         }
@@ -138,26 +162,11 @@ fn acquire_prebuilt(os: &str, arch: &str, target_env: &str, target: &str) -> (Pa
         } else {
             extract_tar_gz(&archive, &extraction);
         }
+        fs::write(stamp, &checksum).expect("failed to record extracted archive checksum");
     }
 
     println!("cargo:warning=Using verified MNN prebuilt `{asset}` from {PREBUILT_REPOSITORY}");
     (root.join("include"), root.join("lib"))
-}
-
-fn target_suffix(os: &str, arch: &str, target_env: &str, target: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("linux", "x86_64") => Some("linux-x86_64"),
-        ("linux", "aarch64") => Some("linux-aarch64"),
-        ("windows", "x86_64") if target_env == "msvc" => Some("windows-x86_64"),
-        ("windows", "x86") if target_env == "msvc" => Some("windows-i686"),
-        ("windows", "aarch64") if target_env == "msvc" => Some("windows-aarch64"),
-        ("macos", _) => Some("macos-universal"),
-        ("ios", "aarch64") if target.contains("-sim") => Some("ios-arm64-sim"),
-        ("ios", "aarch64") => Some("ios-arm64"),
-        ("android", "aarch64") => Some("android-arm64-v8a"),
-        ("android", "arm") => Some("android-armeabi-v7a"),
-        _ => None,
-    }
 }
 
 fn prebuilt_checksum(suffix: &str) -> &'static str {
@@ -260,7 +269,10 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
             .define("MNN_USE_AVX512", "OFF");
     }
     if os == "windows" && target_env == "msvc" {
-        config.define("MNN_WIN_RUNTIME_MT", "ON");
+        config.define(
+            "MNN_WIN_RUNTIME_MT",
+            if target_crt_static() { "ON" } else { "OFF" },
+        );
     }
     if os == "android" {
         let ndk = [
@@ -301,11 +313,7 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
             )
             .define(
                 "CMAKE_OSX_SYSROOT",
-                if target.contains("-sim") {
-                    "iphonesimulator"
-                } else {
-                    "iphoneos"
-                },
+                ios_sdk(target).expect("Mac Catalyst needs an external MNN installation via MNN_INCLUDE_DIR/MNN_LIB_DIR"),
             );
     }
 
@@ -342,7 +350,7 @@ fn acquire_source() -> PathBuf {
     root
 }
 
-fn build_bridge(include: &Path, target_env: &str, prebuilt: bool, link_mode: LinkMode) {
+fn build_bridge(include: &Path, target_env: &str, _prebuilt: bool, _link_mode: LinkMode) {
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -355,9 +363,7 @@ fn build_bridge(include: &Path, target_env: &str, prebuilt: bool, link_mode: Lin
         build
             .flag_if_supported("/std:c++17")
             .flag_if_supported("/EHsc");
-        if prebuilt && link_mode == LinkMode::Static {
-            build.static_crt(true);
-        }
+        build.static_crt(target_crt_static());
     } else {
         build
             .flag_if_supported("-std=c++17")
@@ -423,6 +429,20 @@ fn link_mnn(lib: &Path, os: &str, target_env: &str, mode: LinkMode, prebuilt: bo
     if cfg!(feature = "vulkan") {
         println!("cargo:rustc-link-lib=vulkan");
     }
+    if cfg!(feature = "openmp") {
+        let compiler = cc::Build::new().cpp(true).get_compiler();
+        let library = env::var("MNN_OPENMP_LIB").unwrap_or_else(|_| {
+            if compiler.is_like_clang() {
+                "omp"
+            } else if compiler.is_like_msvc() {
+                "vcomp"
+            } else {
+                "gomp"
+            }
+            .to_owned()
+        });
+        println!("cargo:rustc-link-lib={library}");
+    }
 }
 
 fn ensure_download(url: &str, destination: &Path, expected_sha256: &str) {
@@ -433,7 +453,7 @@ fn ensure_download(url: &str, destination: &Path, expected_sha256: &str) {
         fs::remove_file(destination).expect("failed to remove invalid cached download");
     }
     println!("cargo:warning=Downloading {url}");
-    let temporary = destination.with_extension("partial");
+    let temporary = destination.with_extension(format!("{}.partial", std::process::id()));
     download_file(url, &temporary);
     let actual = checksum(&temporary);
     if actual != expected_sha256 {
@@ -442,13 +462,25 @@ fn ensure_download(url: &str, destination: &Path, expected_sha256: &str) {
             "SHA-256 mismatch for `{url}`: expected {expected_sha256}, got {actual}; the release asset may have changed"
         );
     }
-    fs::rename(&temporary, destination).expect("failed to install verified download");
+    if let Err(error) = fs::rename(&temporary, destination) {
+        if destination.is_file() && checksum(destination) == expected_sha256 {
+            fs::remove_file(temporary).ok();
+        } else {
+            panic!("failed to install verified download: {error}");
+        }
+    }
 }
 
 fn download_file(url: &str, destination: &Path) {
     let curl = Command::new("curl")
         .args([
             "--http1.1",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "600",
+            "--retry",
+            "2",
             "--location",
             "--fail",
             "--silent",
@@ -519,4 +551,11 @@ fn validate_directory(path: &Path, variable: &str) {
         "{variable} is not a directory: {}",
         path.display()
     );
+}
+
+fn target_crt_static() -> bool {
+    env::var("CARGO_CFG_TARGET_FEATURE")
+        .unwrap_or_default()
+        .split(',')
+        .any(|feature| feature == "crt-static")
 }

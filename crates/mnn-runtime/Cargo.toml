@@ -12,7 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/mnn-runtime"
 readme = "README.md"
-include = ["Cargo.toml", "LICENSE", "README.md", "src/**", "examples/**"]
+include = ["Cargo.toml", "LICENSE", "README.md", "src/**", "examples/**", "tests/**"]
 
 [features]
 default = ["prebuilt", "static", "mnn-threadpool"]
@@ -22,7 +22,7 @@ static = ["mnn-runtime-sys/static"]
 dynamic = ["mnn-runtime-sys/dynamic"]
 mnn-threadpool = ["mnn-runtime-sys/mnn-threadpool"]
 metal = ["mnn-runtime-sys/metal"]
-coreml = ["mnn-runtime-sys/coreml"]
+coreml = ["metal", "mnn-runtime-sys/coreml"]
 opencl = ["mnn-runtime-sys/opencl"]
 opengl = ["mnn-runtime-sys/opengl"]
 vulkan = ["mnn-runtime-sys/vulkan"]

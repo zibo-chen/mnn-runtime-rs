@@ -12,15 +12,18 @@ mod model;
 mod runtime;
 mod tensor;
 
-pub use config::{Backend, ExecutionMode, MemoryMode, PowerMode, PrecisionMode, RuntimeConfig};
+pub use config::{
+    Backend, ExecutionMode, GpuMemoryMode, GpuTuning, MemoryMode, PowerMode, PrecisionMode,
+    RuntimeConfig,
+};
 pub use error::{Error, Result};
-pub use model::{Model, ModelInfo};
+pub use model::{InferenceOutput, Model, ModelInfo, PendingRun, RunTimings};
 pub use runtime::Runtime;
 pub use tensor::{Tensor, TensorInfo};
 
 /// Pinned low-level ABI for advanced integration and native-version diagnostics.
 ///
 /// Application code should normally use the safe types in this crate. Exposing
-/// this module ensures every downstream component reaches the same `mnn-sys`
+/// this module ensures every downstream component reaches the same `mnn-runtime-sys`
 /// package instead of embedding another MNN copy.
 pub use mnn_runtime_sys as sys;

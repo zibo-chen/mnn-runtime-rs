@@ -103,6 +103,29 @@ pub enum Error {
         name: String,
     },
 
+    /// The bounded model queue is full. The request was not accepted.
+    #[error("model request queue is full")]
+    QueueFull,
+
+    /// A queued request was cancelled or its handle was dropped.
+    #[error("inference request cancelled")]
+    Cancelled,
+
+    /// A request deadline or result wait expired.
+    #[error("inference deadline exceeded")]
+    DeadlineExceeded,
+
+    /// The existing native pool cannot satisfy the requested thread count.
+    #[error(
+        "requested {requested} CPU threads, but MNN provides {effective}; initialize the largest thread budget first"
+    )]
+    ThreadCountLimited {
+        /// Requested thread count.
+        requested: usize,
+        /// Actual count reported by the session.
+        effective: usize,
+    },
+
     /// A model worker stopped unexpectedly.
     #[error("model worker stopped unexpectedly")]
     WorkerStopped,

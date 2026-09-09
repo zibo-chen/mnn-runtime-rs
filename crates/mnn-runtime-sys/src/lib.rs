@@ -1,15 +1,23 @@
 //! Narrow Rust boundary for the project-owned MNN C++ bridge.
 //!
-//! All raw pointers and FFI calls remain in this crate. `mnn-sys` is still the
-//! sole package declaring `links = "mnn"`; this bridge links to that same native
-//! library and does not compile another MNN copy.
+//! All raw pointers and FFI calls remain in this crate, the sole owner of
+//! `links = "mnn"` and process coordination shared by higher-level runtimes.
 
 #![allow(unsafe_code)]
 
 use std::{ffi::CStr, ptr::NonNull};
 
 /// The pinned Rust ABI crate version.
-pub const MNN_SYS_CRATE_VERSION: &str = "0.1.2";
+pub const MNN_SYS_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Shared gate for complete native transactions, including creation and destruction.
+/// Advanced users opting out must coordinate their own MNN access.
+pub fn execution_gate() -> std::sync::Arc<std::sync::Mutex<()>> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<()>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
 
 /// Native backend identifier understood by MNN.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +54,8 @@ pub struct Config {
     pub power: i32,
     /// MNN memory enum value.
     pub memory: i32,
+    /// GPU tuning/memory bitmask (not a CPU thread count).
+    pub gpu_mode: i32,
 }
 
 /// Native tensor metadata.
@@ -55,6 +65,8 @@ pub struct TensorInfo {
     pub name: String,
     /// Signed native shape. Negative dimensions represent dynamic axes.
     pub shape: Vec<i32>,
+    /// Whether the public contiguous tensor is channel-last (NHWC).
+    pub channel_last: bool,
 }
 
 /// Error returned by the native bridge.
@@ -94,6 +106,7 @@ impl Engine {
             precision: config.precision,
             power: config.power,
             memory: config.memory,
+            gpu_mode: config.gpu_mode,
         };
         let pointer = unsafe {
             ffi::mnn_runtime_engine_create(
@@ -105,6 +118,12 @@ impl Engine {
         NonNull::new(pointer)
             .map(|pointer| Self { pointer })
             .ok_or_else(|| last_error(None, None))
+    }
+
+    /// Actual CPU thread count, or `None` for GPU sessions.
+    pub fn effective_threads(&self) -> Option<usize> {
+        let value = unsafe { ffi::mnn_runtime_effective_threads(self.pointer.as_ptr()) };
+        (value > 0).then_some(value as usize)
     }
 
     /// Inspect all input tensors.
@@ -119,11 +138,23 @@ impl Engine {
 
     /// Copy a named contiguous `f32` input into MNN.
     pub fn write_input(&mut self, name: &str, data: &[f32]) -> Result<(), NativeError> {
+        let index = self
+            .inputs()?
+            .iter()
+            .position(|t| t.name == name)
+            .ok_or_else(|| NativeError {
+                status: Some(4),
+                message: format!("unknown input {name}"),
+            })?;
+        self.write_input_index(index, data)
+    }
+
+    /// Copy into a pre-resolved input slot; an invalid index is rejected by the bridge.
+    pub fn write_input_index(&mut self, index: usize, data: &[f32]) -> Result<(), NativeError> {
         let status = unsafe {
-            ffi::mnn_runtime_write_input_f32(
+            ffi::mnn_runtime_write_input_index_f32(
                 self.pointer.as_ptr(),
-                name.as_ptr(),
-                name.len(),
+                index,
                 data.as_ptr(),
                 data.len(),
             )
@@ -139,11 +170,23 @@ impl Engine {
 
     /// Copy a named contiguous `f32` output from MNN.
     pub fn read_output(&mut self, name: &str, data: &mut [f32]) -> Result<(), NativeError> {
+        let index = self
+            .outputs()?
+            .iter()
+            .position(|t| t.name == name)
+            .ok_or_else(|| NativeError {
+                status: Some(4),
+                message: format!("unknown output {name}"),
+            })?;
+        self.read_output_index(index, data)
+    }
+
+    /// Copy from a pre-resolved output slot; an invalid index is rejected by the bridge.
+    pub fn read_output_index(&mut self, index: usize, data: &mut [f32]) -> Result<(), NativeError> {
         let status = unsafe {
-            ffi::mnn_runtime_read_output_f32(
+            ffi::mnn_runtime_read_output_index_f32(
                 self.pointer.as_ptr(),
-                name.as_ptr(),
-                name.len(),
+                index,
                 data.as_mut_ptr(),
                 data.len(),
             )
@@ -175,7 +218,13 @@ impl Engine {
                 )
             };
             self.check(status)?;
-            tensors.push(TensorInfo { name, shape });
+            let channel_last =
+                unsafe { ffi::mnn_runtime_tensor_layout(self.pointer.as_ptr(), input, index) == 1 };
+            tensors.push(TensorInfo {
+                name,
+                shape,
+                channel_last,
+            });
         }
         Ok(tensors)
     }
@@ -242,6 +291,7 @@ mod ffi {
         pub precision: i32,
         pub power: i32,
         pub memory: i32,
+        pub gpu_mode: i32,
     }
 
     unsafe extern "C" {
@@ -252,6 +302,12 @@ mod ffi {
             model_size: usize,
             config: *const MnnRuntimeConfig,
         ) -> *mut MnnRuntimeEngine;
+        pub fn mnn_runtime_effective_threads(engine: *const MnnRuntimeEngine) -> i32;
+        pub fn mnn_runtime_tensor_layout(
+            engine: *const MnnRuntimeEngine,
+            input: i32,
+            index: usize,
+        ) -> i32;
         pub fn mnn_runtime_engine_destroy(engine: *mut MnnRuntimeEngine);
         pub fn mnn_runtime_last_error(engine: *const MnnRuntimeEngine) -> *const c_char;
         pub fn mnn_runtime_tensor_count(engine: *const MnnRuntimeEngine, input: i32) -> usize;
@@ -272,18 +328,16 @@ mod ffi {
             dimensions: *mut i32,
             capacity: usize,
         ) -> i32;
-        pub fn mnn_runtime_write_input_f32(
+        pub fn mnn_runtime_write_input_index_f32(
             engine: *mut MnnRuntimeEngine,
-            name: *const u8,
-            name_length: usize,
+            index: usize,
             data: *const f32,
             element_count: usize,
         ) -> i32;
         pub fn mnn_runtime_run(engine: *mut MnnRuntimeEngine) -> i32;
-        pub fn mnn_runtime_read_output_f32(
+        pub fn mnn_runtime_read_output_index_f32(
             engine: *mut MnnRuntimeEngine,
-            name: *const u8,
-            name_length: usize,
+            index: usize,
             data: *mut f32,
             element_count: usize,
         ) -> i32;

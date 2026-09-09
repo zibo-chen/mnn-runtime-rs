@@ -16,6 +16,7 @@ typedef struct MnnRuntimeConfig {
     int32_t precision;
     int32_t power;
     int32_t memory;
+    int32_t gpu_mode;
 } MnnRuntimeConfig;
 
 enum MnnRuntimeStatus {
@@ -38,6 +39,8 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
     const void *model,
     size_t model_size,
     const MnnRuntimeConfig *config);
+int32_t mnn_runtime_effective_threads(const MnnRuntimeEngine *engine);
+int32_t mnn_runtime_tensor_layout(const MnnRuntimeEngine *engine, int32_t input, size_t index);
 void mnn_runtime_engine_destroy(MnnRuntimeEngine *engine);
 const char *mnn_runtime_last_error(const MnnRuntimeEngine *engine);
 
@@ -57,17 +60,15 @@ int32_t mnn_runtime_tensor_shape(
     int32_t *dimensions,
     size_t capacity);
 
-int32_t mnn_runtime_write_input_f32(
+int32_t mnn_runtime_write_input_index_f32(
     MnnRuntimeEngine *engine,
-    const uint8_t *name,
-    size_t name_length,
+    size_t index,
     const float *data,
     size_t element_count);
 int32_t mnn_runtime_run(MnnRuntimeEngine *engine);
-int32_t mnn_runtime_read_output_f32(
+int32_t mnn_runtime_read_output_index_f32(
     MnnRuntimeEngine *engine,
-    const uint8_t *name,
-    size_t name_length,
+    size_t index,
     float *data,
     size_t element_count);
 

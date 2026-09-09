@@ -2,12 +2,10 @@
 
 use std::{
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use crate::{Error, ExecutionMode, Model, Result, RuntimeConfig};
-
-static PROCESS_EXECUTION_GATE: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 /// Shareable model factory and process-level MNN execution policy.
 #[derive(Debug, Clone)]
@@ -35,21 +33,23 @@ impl Runtime {
     /// Returns an error if the thread count is invalid or the selected backend
     /// was not compiled or registered by the linked MNN library.
     pub fn new(config: RuntimeConfig) -> Result<Self> {
-        if config.threads == 0 {
+        if config.threads == 0 || config.threads > 32 {
             return Err(Error::InvalidConfig(
-                "thread count must be greater than zero".to_owned(),
+                "thread count must be between 1 and 32".to_owned(),
             ));
         }
         i32::try_from(config.threads)
             .map_err(|_| Error::InvalidConfig("thread count does not fit in an i32".to_owned()))?;
+        if config.queue_capacity == 0 {
+            return Err(Error::InvalidConfig(
+                "queue capacity must be positive".to_owned(),
+            ));
+        }
+        super::model::gpu_mode(&config)?;
         super::model::validate_backend(config.backend)?;
 
         let execution_gate = match config.execution {
-            ExecutionMode::Serialized => Some(
-                PROCESS_EXECUTION_GATE
-                    .get_or_init(|| Arc::new(Mutex::new(())))
-                    .clone(),
-            ),
+            ExecutionMode::Serialized => Some(mnn_runtime_sys::execution_gate()),
             ExecutionMode::Parallel => None,
         };
 
