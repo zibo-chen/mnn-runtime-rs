@@ -75,7 +75,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: native-${{ matrix.features }}
+          key: native-${{ strategy.job-index }}
       - run: cargo test -p mnn-runtime --no-default-features --features '${{ matrix.features }}' --locked
 
   prebuilt:
@@ -124,7 +124,11 @@ jobs:
           arch: ${{ matrix.msvc }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: prebuilt-${{ matrix.target }}-${{ matrix.features }}
+          key: prebuilt-${{ matrix.target }}-${{ strategy.job-index }}
+      - name: Disable unrelated third-party apt feeds
+        if: runner.os == 'Linux' && (matrix.features == 'cuda' || matrix.backend == 'vulkan')
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
       - name: Install CUDA 12.8 (Linux)
         if: matrix.features == 'cuda' && runner.os == 'Linux'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
@@ -157,11 +161,8 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'ndk;27.2.12479018'
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Verify prebuilt static/shared consumers
-        shell: bash
-        run: |
-          args=(--target "$BUILD_TARGET" --features "$BUILD_FEATURES")
-          if [ -n "$TEST_BACKEND" ]; then args+=(--backend "$TEST_BACKEND"); fi
-          python scripts/ci_prebuilt.py "${args[@]}"
+        # Keep the native Windows shell so Git Bash's link.exe cannot shadow MSVC.
+        run: python scripts/ci_prebuilt.py
         env:
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_FEATURES: ${{ matrix.features }}

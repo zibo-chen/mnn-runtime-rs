@@ -442,29 +442,14 @@ fn link_mnn(
             if libraries.is_empty() {
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             } else {
-                let compiler = cc::Build::new().cpp(true).get_compiler();
                 for library in libraries {
-                    let archive_name = format!("lib{library}.a");
-                    let output = compiler
-                        .to_command()
-                        .arg(format!("-print-file-name={archive_name}"))
-                        .output()
-                        .expect("failed to query target C++ compiler");
-                    let archive = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-                    assert!(
-                        output.status.success() && archive.is_absolute() && archive.is_file(),
-                        "static-cpp-runtime requires {archive_name} in the target toolchain"
-                    );
-                    println!(
-                        "cargo:rustc-link-search=native={}",
-                        archive.parent().unwrap().display()
-                    );
-                    println!("cargo:rustc-link-lib=static={library}");
+                    link_toolchain_static_library(library);
                 }
             }
         }
         ("android", _) => {
-            println!("cargo:rustc-link-lib=static=c++_static");
+            link_toolchain_static_library("c++_static");
+            link_toolchain_static_library("c++abi");
             println!("cargo:rustc-link-lib=log");
             println!("cargo:rustc-link-lib=android");
             println!("cargo:rustc-link-lib=m");
@@ -501,7 +486,9 @@ fn link_mnn(
             }
         }
         if let Some(library) = cuda_side_library(os, true) {
-            let companion = if prebuilt.is_some() && mode == LinkMode::Static {
+            let companion = if mode == LinkMode::Static
+                && (prebuilt.is_some() || lib.join("cuda-static").is_dir())
+            {
                 lib.join("cuda-static")
             } else {
                 lib.to_owned()
@@ -554,6 +541,31 @@ fn cuda_root() -> Option<PathBuf> {
                 .is_dir()
                 .then(|| PathBuf::from("/usr/local/cuda"))
         })
+}
+
+fn link_toolchain_static_library(library: &str) {
+    let archive_name = format!("lib{library}.a");
+    let output = cc::Build::new()
+        .cpp(true)
+        .get_compiler()
+        .to_command()
+        .arg(format!("-print-file-name={archive_name}"))
+        .output()
+        .expect("failed to query target C++ compiler");
+    let archive = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    assert!(
+        output.status.success() && archive.is_absolute() && archive.is_file(),
+        "{archive_name} is missing from the target C++ toolchain; check CXX and the SDK installation"
+    );
+    // The NDK runtime directory also contains libc.a. Adding that directory to
+    // the search path would shadow the API-specific libc.so stubs, so isolate
+    // only the requested C++ runtime archives inside OUT_DIR.
+    let runtime_dir = PathBuf::from(required_env("OUT_DIR")).join("cxx-runtime");
+    fs::create_dir_all(&runtime_dir).expect("failed to create C++ runtime directory");
+    fs::copy(&archive, runtime_dir.join(&archive_name))
+        .expect("failed to copy target C++ runtime archive");
+    println!("cargo:rustc-link-search=native={}", runtime_dir.display());
+    println!("cargo:rustc-link-lib=static={library}");
 }
 
 fn validate_cuda_prebuilt() {

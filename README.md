@@ -165,7 +165,9 @@ Android packages use NDK r27c, API 21 and `c++_static`.
 
 iOS archives are static and have no MNN thread pool. Select them with
 `default-features = false, features = ["prebuilt", "static", "metal"]`
-(or `"coreml"`). Enabling `mnn-threadpool` or dynamic linking on iOS builds
+(or `"coreml"`) and set `IPHONEOS_DEPLOYMENT_TARGET=13.0` (or newer) when
+invoking Cargo; Rust's default device deployment target is too old for these
+archives. Enabling `mnn-threadpool` or dynamic linking on iOS builds
 from source. Other prebuilts require `mnn-threadpool` and exclude OpenMP.
 Unsupported targets, feature combinations or CRT/threading policies fall back
 to the checksum-pinned source commit. Set `MNN_REQUIRE_PREBUILT=1` to make a
@@ -320,7 +322,8 @@ optionally `MNN_CUDA_ARCHS` for CMake's `CUDA_ARCHS`. Linux installs/links
 `lib/cuda-static/libMNN_Cuda_Main.so`; dynamic MNN uses the copy in `lib/`.
 Ship the matching side library and
 make it discoverable by the dynamic loader along with CUDA's runtime/cuBLAS.
-Source builds and external Linux CUDA installations use the companion in
-`MNN_LIB_DIR`. Windows
+Source builds use the companion in `MNN_LIB_DIR`. External SDKs with a
+`cuda-static/` subdirectory use it for static linking, otherwise they use
+`MNN_LIB_DIR` directly. Windows
 CUDA requires MSVC; MinGW CUDA is not supported by this baseline. Static GPU
 archives use whole-archive linking to retain backend registrations.

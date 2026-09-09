@@ -15,15 +15,19 @@ def run(command, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--features", default="")
-    parser.add_argument("--backend", help="Also require inference on this provisioned device")
+    parser.add_argument("--target", default=os.environ.get("BUILD_TARGET"))
+    parser.add_argument("--features", default=os.environ.get("BUILD_FEATURES", ""))
+    parser.add_argument("--backend", default=os.environ.get("TEST_BACKEND"), help="Also require inference on this provisioned device")
     args = parser.parse_args()
+    if not args.target:
+        parser.error("--target or BUILD_TARGET is required")
     env = os.environ.copy()
     env["MNN_REQUIRE_PREBUILT"] = "1"
     env.setdefault("MNN_PREBUILT_CACHE_DIR", str(Path("target/native-downloads").resolve()))
     target = args.target
     ios = "-apple-ios" in target
+    if ios:
+        env.setdefault("IPHONEOS_DEPLOYMENT_TARGET", "13.0")
     if "android" in target:
         ndk = Path(env["ANDROID_NDK_ROOT"])
         host = "darwin-x86_64" if platform.system() == "Darwin" else "linux-x86_64"

@@ -200,7 +200,7 @@ MnnRuntimeEngine *mnn_runtime_engine_create(
 
         int backends[2] = {-1, -1};
         engine->interpreter->getSessionInfo(engine->session, MNN::Interpreter::BACKENDS, backends);
-        if (backends[0] == MNN_FORWARD_CPU) {
+        if (backends[0] == MNN_FORWARD_CPU || backends[0] == MNN_FORWARD_CPU_EXTENSION) {
             engine->interpreter->getSessionInfo(engine->session, MNN::Interpreter::THREAD_NUMBER, &engine->effective_threads);
         }
         refresh_tensors(engine.get());
