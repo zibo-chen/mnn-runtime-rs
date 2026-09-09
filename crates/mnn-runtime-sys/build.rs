@@ -7,15 +7,15 @@ use std::{
 };
 
 mod build_support;
-use build_support::{ios_sdk, target_suffix};
+mod prebuilt;
+use build_support::{cuda_side_library, cuda_target_supported, ios_sdk, static_cpp_libraries};
+use prebuilt::{
+    select_prebuilt, PrebuiltArtifact, PrebuiltFeatures, MNN_SOURCE_REVISION, MNN_SOURCE_SHA256,
+    MNN_SOURCE_VERSION, PREBUILT_REPOSITORY, PREBUILT_TAG,
+};
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
-
-const PREBUILT_REPOSITORY: &str = "zibo-chen/MNN-Prebuilds";
-const PREBUILT_TAG: &str = "dev";
-const MNN_SOURCE_VERSION: &str = "3.6.0";
-const MNN_SOURCE_SHA256: &str = "4ddbe825a22ee06e8c237bf3382231d5b6130878c850291d015808946cb87690";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LinkMode {
@@ -26,6 +26,7 @@ enum LinkMode {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support.rs");
+    println!("cargo:rerun-if-changed=prebuilt.rs");
     println!("cargo:rerun-if-changed=cpp/mnn_runtime_bridge.cpp");
     println!("cargo:rerun-if-changed=cpp/mnn_runtime_bridge.h");
     for variable in [
@@ -35,8 +36,13 @@ fn main() {
         "MNN_PREBUILT_BASE_URL",
         "MNN_PREBUILT_TAG",
         "MNN_PREBUILT_SHA256",
+        "MNN_REQUIRE_PREBUILT",
         "MNN_SOURCE_DIR",
         "MNN_OPENMP_LIB",
+        "CUDA_PATH",
+        "CUDA_HOME",
+        "CUDA_TOOLKIT_ROOT_DIR",
+        "MNN_CUDA_ARCHS",
         "DOCS_RS",
         "ANDROID_NDK_ROOT",
         "ANDROID_NDK_HOME",
@@ -72,22 +78,48 @@ fn main() {
     if cfg!(feature = "openmp") && matches!(target_os.as_str(), "macos" | "ios") {
         panic!("this MNN baseline does not support OpenMP on Apple targets");
     }
-    let has_prebuilt = prebuilt_compatible(&target_os)
-        && target_suffix(&target_os, &target_arch, &target_env, &target).is_some();
+    if cfg!(feature = "cuda") && !cuda_target_supported(&target_os, &target_env) {
+        panic!("feature `cuda` requires Linux or Windows MSVC and the NVIDIA CUDA toolkit");
+    }
+    let artifact = select_prebuilt(
+        &target_os,
+        &target_arch,
+        &target_env,
+        &target,
+        PrebuiltFeatures {
+            metal: cfg!(feature = "metal"),
+            coreml: cfg!(feature = "coreml"),
+            opencl: cfg!(feature = "opencl"),
+            opengl: cfg!(feature = "opengl"),
+            vulkan: cfg!(feature = "vulkan"),
+            cuda: cfg!(feature = "cuda"),
+            threadpool: cfg!(feature = "mnn-threadpool"),
+            openmp: cfg!(feature = "openmp"),
+            crt_static: target_crt_static(),
+            dynamic: link_mode == LinkMode::Dynamic,
+        },
+    );
     let (include_dir, lib_dir, prebuilt) = if let Some(external) = external_installation() {
-        (external.0, external.1, false)
-    } else if cfg!(feature = "build-from-source") || !has_prebuilt {
-        let installation = build_from_source(&target_os, &target_arch, &target_env, &target);
-        (installation.0, installation.1, false)
-    } else if cfg!(feature = "prebuilt") {
-        let installation = acquire_prebuilt(&target_os, &target_arch, &target_env, &target);
-        (installation.0, installation.1, true)
+        (external.0, external.1, None)
+    } else if let Some(artifact) =
+        artifact.filter(|_| cfg!(feature = "prebuilt") && !cfg!(feature = "build-from-source"))
+    {
+        if artifact.has_backend("cuda") {
+            validate_cuda_prebuilt();
+        }
+        let installation = acquire_prebuilt(artifact, &target_os);
+        (installation.0, installation.1, Some(artifact))
     } else {
+        assert!(
+            env::var("MNN_REQUIRE_PREBUILT").as_deref() != Ok("1"),
+            "no compatible prebuilt for `{target}` with the selected features/CRT/threading; source fallback disabled by MNN_REQUIRE_PREBUILT=1"
+        );
+        println!("cargo:warning=No compatible prebuilt selected; compiling MNN from source");
         let installation = build_from_source(&target_os, &target_arch, &target_env, &target);
-        (installation.0, installation.1, false)
+        (installation.0, installation.1, None)
     };
 
-    build_bridge(&include_dir, &target_env, prebuilt, link_mode);
+    build_bridge(&include_dir, &target_env, link_mode);
     link_mnn(&lib_dir, &target_os, &target_env, link_mode, prebuilt);
     println!("cargo:metadata=include={}", include_dir.display());
 }
@@ -106,31 +138,13 @@ fn external_installation() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-fn prebuilt_compatible(target_os: &str) -> bool {
-    let metal_ok = !cfg!(feature = "metal") || matches!(target_os, "macos" | "ios");
-    let unsupported_backend = cfg!(feature = "coreml")
-        || cfg!(feature = "opencl")
-        || cfg!(feature = "opengl")
-        || cfg!(feature = "vulkan")
-        || cfg!(feature = "openmp");
-    metal_ok
-        && !unsupported_backend
-        && cfg!(feature = "mnn-threadpool")
-        && (target_os != "windows" || target_crt_static())
-}
-
-fn acquire_prebuilt(os: &str, arch: &str, target_env: &str, target: &str) -> (PathBuf, PathBuf) {
-    let suffix = target_suffix(os, arch, target_env, target).unwrap_or_else(|| {
-        panic!(
-            "MNN-Prebuilds has no artifact for target `{target}`; enable `build-from-source` or provide MNN_INCLUDE_DIR and MNN_LIB_DIR"
-        )
-    });
+fn acquire_prebuilt(artifact: &PrebuiltArtifact, os: &str) -> (PathBuf, PathBuf) {
     let tag = env::var("MNN_PREBUILT_TAG").unwrap_or_else(|_| PREBUILT_TAG.to_owned());
-    let asset = format!("mnn-{tag}-{suffix}");
+    let asset = format!("{tag}-{}", artifact.suffix);
     let extension = if os == "windows" { "zip" } else { "tar.gz" };
     let checksum = env::var("MNN_PREBUILT_SHA256")
         .ok()
-        .or_else(|| (tag == PREBUILT_TAG).then(|| prebuilt_checksum(suffix).to_owned()))
+        .or_else(|| (tag == PREBUILT_TAG).then(|| artifact.sha256.to_owned()))
         .unwrap_or_else(|| {
             panic!("MNN_PREBUILT_SHA256 is required when MNN_PREBUILT_TAG is not `{PREBUILT_TAG}`")
         });
@@ -169,27 +183,12 @@ fn acquire_prebuilt(os: &str, arch: &str, target_env: &str, target: &str) -> (Pa
     (root.join("include"), root.join("lib"))
 }
 
-fn prebuilt_checksum(suffix: &str) -> &'static str {
-    match suffix {
-        "android-arm64-v8a" => "5d12bb49d7a020c8fdb9f01a40f208fdc08da51d0aadb016d4609aee7f63572c",
-        "android-armeabi-v7a" => "35af840ad4d2aa2bf2078c2cc904629ea4556616c2729c8e91ce8ccb15a072ec",
-        "ios-arm64-sim" => "db140b3cca7d03348fd230fff73f9ec38d6421d5a6bad86d5ad8af423d924206",
-        "ios-arm64" => "46b5352801ee341e1fecd02622ea43b5633c2128e46dcec84e1761a5f458ad3e",
-        "linux-aarch64" => "1ce0b2ed372fbb1db49273d8b835ae5338a0696002f3a6632ec8a14ff52bd50e",
-        "linux-x86_64" => "0692b88f2a4caa4c1a3793bf93c84317e1f999e515102c91ddc278aa18b2a4df",
-        "macos-universal" => "61e0f340b062cae44d0995610c90ad46b9609839f02854b61f4164ea91698bbd",
-        "windows-aarch64" => "f46a233cc4ccbfb02d2edd3864891c7589ad9ed9fbaacd8c534d3d02cc183912",
-        "windows-i686" => "9444706efa25add47732e6b88fe46ecf9921ce6dd28f8e8274932fcf9a42c38",
-        "windows-x86_64" => "24166165d7451423aef3ebe6694651bad117bcdfc32261652b8f8275961ab91a",
-        _ => panic!("no checksum is recorded for MNN prebuilt suffix `{suffix}`"),
-    }
-}
-
 fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (PathBuf, PathBuf) {
     let source = acquire_source();
     let mut config = cmake::Config::new(&source);
     config
         .profile("Release")
+        .define("CMAKE_POLICY_VERSION_MINIMUM", "3.10")
         .define(
             "MNN_BUILD_SHARED_LIBS",
             if cfg!(feature = "dynamic") {
@@ -206,6 +205,8 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
         .define("MNN_BUILD_CONVERTER", "OFF")
         .define("MNN_PORTABLE_BUILD", "ON")
         .define("MNN_SEP_BUILD", "OFF")
+        .define("MNN_USE_SYSTEM_LIB", "OFF")
+        .define("MNN_KLEIDIAI", "OFF")
         .define(
             "MNN_USE_THREAD_POOL",
             if cfg!(feature = "mnn-threadpool") {
@@ -259,6 +260,18 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
             },
         );
 
+    config.define(
+        "MNN_CUDA",
+        if cfg!(feature = "cuda") { "ON" } else { "OFF" },
+    );
+    if cfg!(feature = "cuda") {
+        if let Some(root) = cuda_root() {
+            config.define("CUDA_TOOLKIT_ROOT_DIR", root);
+        }
+        if let Ok(architectures) = env::var("MNN_CUDA_ARCHS") {
+            config.define("CUDA_ARCHS", architectures);
+        }
+    }
     if arch == "x86_64" && !matches!(os, "android" | "ios") {
         config.define("MNN_USE_SSE", "ON");
     } else {
@@ -319,6 +332,19 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
 
     println!("cargo:warning=Building MNN {MNN_SOURCE_VERSION} from source for `{target}`");
     let installation = config.build();
+    if let Some(library) = cuda_side_library(os, cfg!(feature = "cuda")) {
+        let filename = format!("lib{library}.so");
+        let source = installation
+            .join("build/source/backend/cuda")
+            .join(&filename);
+        let destination = installation.join("lib").join(&filename);
+        fs::copy(&source, &destination).unwrap_or_else(|error| {
+            panic!(
+                "failed to install CUDA side library {}: {error}",
+                source.display()
+            )
+        });
+    }
     (installation.join("include"), installation.join("lib"))
 }
 
@@ -336,13 +362,12 @@ fn acquire_source() -> PathBuf {
     let out_dir = PathBuf::from(required_env("OUT_DIR"));
     let root = out_dir
         .join("source")
-        .join(format!("MNN-{MNN_SOURCE_VERSION}"));
+        .join(format!("MNN-{MNN_SOURCE_REVISION}"));
     if root.join("CMakeLists.txt").is_file() {
         return root;
     }
-    let archive = out_dir.join(format!("MNN-{MNN_SOURCE_VERSION}.tar.gz"));
-    let url =
-        format!("https://codeload.github.com/alibaba/MNN/tar.gz/refs/tags/{MNN_SOURCE_VERSION}");
+    let archive = out_dir.join(format!("MNN-{MNN_SOURCE_REVISION}.tar.gz"));
+    let url = format!("https://codeload.github.com/alibaba/MNN/tar.gz/{MNN_SOURCE_REVISION}");
     ensure_download(&url, &archive, MNN_SOURCE_SHA256);
     let destination = out_dir.join("source");
     fs::create_dir_all(&destination).expect("failed to create MNN source directory");
@@ -350,7 +375,7 @@ fn acquire_source() -> PathBuf {
     root
 }
 
-fn build_bridge(include: &Path, target_env: &str, _prebuilt: bool, _link_mode: LinkMode) {
+fn build_bridge(include: &Path, target_env: &str, link_mode: LinkMode) {
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -364,6 +389,9 @@ fn build_bridge(include: &Path, target_env: &str, _prebuilt: bool, _link_mode: L
             .flag_if_supported("/std:c++17")
             .flag_if_supported("/EHsc");
         build.static_crt(target_crt_static());
+        if link_mode == LinkMode::Dynamic {
+            build.define("USING_MNN_DLL", None);
+        }
     } else {
         build
             .flag_if_supported("-std=c++17")
@@ -372,12 +400,32 @@ fn build_bridge(include: &Path, target_env: &str, _prebuilt: bool, _link_mode: L
     build.compile("mnn_runtime_bridge");
 }
 
-fn link_mnn(lib: &Path, os: &str, target_env: &str, mode: LinkMode, prebuilt: bool) {
+fn link_mnn(
+    lib: &Path,
+    os: &str,
+    target_env: &str,
+    mode: LinkMode,
+    prebuilt: Option<&PrebuiltArtifact>,
+) {
     println!("cargo:rustc-link-search=native={}", lib.display());
-    match (os, mode, prebuilt) {
-        ("windows", LinkMode::Static, true) => println!("cargo:rustc-link-lib=static=MNN_static"),
-        (_, LinkMode::Static, _) => println!("cargo:rustc-link-lib=static=MNN"),
-        (_, LinkMode::Dynamic, _) => println!("cargo:rustc-link-lib=dylib=MNN"),
+    let whole_archive = prebuilt.is_some()
+        || cfg!(feature = "cuda")
+        || cfg!(feature = "metal")
+        || cfg!(feature = "coreml")
+        || cfg!(feature = "opencl")
+        || cfg!(feature = "opengl")
+        || cfg!(feature = "vulkan");
+    let static_kind = if whole_archive {
+        "static:+whole-archive"
+    } else {
+        "static"
+    };
+    match (os, mode) {
+        ("windows", LinkMode::Static) if lib.join("MNN_static.lib").is_file() => {
+            println!("cargo:rustc-link-lib={static_kind}=MNN_static")
+        }
+        (_, LinkMode::Static) => println!("cargo:rustc-link-lib={static_kind}=MNN"),
+        (_, LinkMode::Dynamic) => println!("cargo:rustc-link-lib=dylib=MNN"),
     }
 
     match (os, target_env) {
@@ -388,35 +436,90 @@ fn link_mnn(lib: &Path, os: &str, target_env: &str, mode: LinkMode, prebuilt: bo
             println!("cargo:rustc-link-lib=pthread");
             println!("cargo:rustc-link-lib=dl");
         }
+        ("windows", "gnu") => {
+            let libraries =
+                static_cpp_libraries(os, target_env, cfg!(feature = "static-cpp-runtime"));
+            if libraries.is_empty() {
+                println!("cargo:rustc-link-lib=dylib=stdc++");
+            } else {
+                let compiler = cc::Build::new().cpp(true).get_compiler();
+                for library in libraries {
+                    let archive_name = format!("lib{library}.a");
+                    let output = compiler
+                        .to_command()
+                        .arg(format!("-print-file-name={archive_name}"))
+                        .output()
+                        .expect("failed to query target C++ compiler");
+                    let archive = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+                    assert!(
+                        output.status.success() && archive.is_absolute() && archive.is_file(),
+                        "static-cpp-runtime requires {archive_name} in the target toolchain"
+                    );
+                    println!(
+                        "cargo:rustc-link-search=native={}",
+                        archive.parent().unwrap().display()
+                    );
+                    println!("cargo:rustc-link-lib=static={library}");
+                }
+            }
+        }
         ("android", _) => {
             println!("cargo:rustc-link-lib=static=c++_static");
             println!("cargo:rustc-link-lib=log");
+            println!("cargo:rustc-link-lib=android");
+            println!("cargo:rustc-link-lib=m");
+            println!("cargo:rustc-link-lib=dl");
         }
         _ => {}
     }
-    if matches!(os, "macos" | "ios") && (prebuilt || cfg!(feature = "metal")) {
+    if matches!(os, "macos" | "ios") && (prebuilt.is_some() || cfg!(feature = "metal")) {
         for framework in [
             "Foundation",
             "CoreFoundation",
+            "CoreGraphics",
             "Metal",
             "MetalPerformanceShaders",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
         println!("cargo:rustc-link-lib=objc");
+        if os == "ios" {
+            println!("cargo:rustc-link-lib=framework=UIKit");
+        }
     }
     if cfg!(feature = "coreml") && matches!(os, "macos" | "ios") {
         println!("cargo:rustc-link-lib=framework=CoreML");
         println!("cargo:rustc-link-lib=framework=CoreVideo");
     }
-    if cfg!(feature = "opencl") {
-        if os == "macos" {
-            println!("cargo:rustc-link-lib=framework=OpenCL");
-        } else {
-            println!("cargo:rustc-link-lib=OpenCL");
+    if cfg!(feature = "cuda") {
+        if let Some(root) = cuda_root() {
+            for suffix in ["lib64", "lib/x64", "lib"] {
+                let directory = root.join(suffix);
+                if directory.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", directory.display());
+                }
+            }
         }
+        if let Some(library) = cuda_side_library(os, true) {
+            let companion = if prebuilt.is_some() && mode == LinkMode::Static {
+                lib.join("cuda-static")
+            } else {
+                lib.to_owned()
+            };
+            assert!(
+                companion.join(format!("lib{library}.so")).is_file(),
+                "CUDA companion lib{library}.so is missing from {}",
+                companion.display()
+            );
+            println!("cargo:rustc-link-search=native={}", companion.display());
+            println!("cargo:rustc-link-lib=dylib={library}");
+        }
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        println!("cargo:rustc-link-lib=dylib=cublas");
     }
-    if cfg!(feature = "opengl") {
+    // Vulkan/OpenCL profiles use MNN's dynamic loaders, not SDK link libraries.
+    // Android profiles include GLES even when only Vulkan/OpenCL was requested.
+    if cfg!(feature = "opengl") || prebuilt.is_some_and(|p| p.has_backend("opengl")) {
         match os {
             "android" => {
                 println!("cargo:rustc-link-lib=GLESv3");
@@ -425,9 +528,6 @@ fn link_mnn(lib: &Path, os: &str, target_env: &str, mode: LinkMode, prebuilt: bo
             "linux" => println!("cargo:rustc-link-lib=GL"),
             _ => {}
         }
-    }
-    if cfg!(feature = "vulkan") {
-        println!("cargo:rustc-link-lib=vulkan");
     }
     if cfg!(feature = "openmp") {
         let compiler = cc::Build::new().cpp(true).get_compiler();
@@ -443,6 +543,35 @@ fn link_mnn(lib: &Path, os: &str, target_env: &str, mode: LinkMode, prebuilt: bo
         });
         println!("cargo:rustc-link-lib={library}");
     }
+}
+
+fn cuda_root() -> Option<PathBuf> {
+    ["CUDA_TOOLKIT_ROOT_DIR", "CUDA_PATH", "CUDA_HOME"]
+        .iter()
+        .find_map(|name| env::var_os(name).map(PathBuf::from))
+        .or_else(|| {
+            Path::new("/usr/local/cuda")
+                .is_dir()
+                .then(|| PathBuf::from("/usr/local/cuda"))
+        })
+}
+
+fn validate_cuda_prebuilt() {
+    let root = cuda_root().expect(
+        "CUDA 12 prebuilts require CUDA Toolkit >=12.8,<13; set CUDA_PATH, CUDA_HOME or CUDA_TOOLKIT_ROOT_DIR",
+    );
+    let header = fs::read_to_string(root.join("include/cuda.h"))
+        .expect("CUDA toolkit is missing include/cuda.h");
+    let version = header.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next() == Some("#define") && fields.next() == Some("CUDA_VERSION"))
+            .then(|| fields.next()?.parse::<u32>().ok())
+            .flatten()
+    });
+    assert!(
+        version.is_some_and(|version| (12080..13000).contains(&version)),
+        "CUDA 12 prebuilts require Toolkit >=12.8,<13; use build-from-source for a different toolkit"
+    );
 }
 
 fn ensure_download(url: &str, destination: &Path, expected_sha256: &str) {

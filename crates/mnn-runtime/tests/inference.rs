@@ -41,8 +41,12 @@ fn real_models_preserve_logical_layout_and_repeated_values() {
             } else {
                 values
             };
-            let tensor =
-                Tensor::new("input", model.info().inputs()[0].shape().to_vec(), data).unwrap();
+            let tensor = Tensor::new(
+                "input",
+                model.info().inputs()[0].concrete_shape().unwrap(),
+                data,
+            )
+            .unwrap();
             let outputs = model.run_owned(vec![tensor]).unwrap();
             assert_eq!(outputs[0].data(), expected);
         }

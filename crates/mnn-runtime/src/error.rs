@@ -73,7 +73,7 @@ pub enum Error {
         /// Tensor name.
         name: String,
         /// Shape declared by the model.
-        expected: Vec<usize>,
+        expected: Vec<i32>,
         /// Shape supplied by the caller.
         actual: Vec<usize>,
     },
@@ -89,18 +89,37 @@ pub enum Error {
         actual: usize,
     },
 
-    /// Shape element count overflowed `usize`.
+    /// Shape element count overflowed or exceeded native allocation limits.
     #[error("tensor `{name}` shape is too large")]
     ShapeOverflow {
         /// Tensor name.
         name: String,
     },
 
-    /// Dynamic tensor shapes are not implemented by this release.
-    #[error("model tensor `{name}` has a dynamic shape; dynamic shapes are not supported yet")]
-    DynamicShapeUnsupported {
+    /// A shape is not concrete yet.
+    #[error("tensor `{name}` shape is unresolved; supply concrete input dimensions")]
+    UnresolvedShape {
         /// Tensor name.
         name: String,
+    },
+
+    /// Concrete shapes must have positive dimensions and rank at most eight.
+    #[error("tensor `{name}` has invalid dimensions {shape:?}")]
+    InvalidShape {
+        /// Tensor name.
+        name: String,
+        /// Supplied dimensions.
+        shape: Vec<usize>,
+    },
+
+    /// Cache directory creation failed.
+    #[error("failed to prepare cache directory `{path}`: {source}")]
+    CacheDirectory {
+        /// Cache directory.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: std::io::Error,
     },
 
     /// The bounded model queue is full. The request was not accepted.

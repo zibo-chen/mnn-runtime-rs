@@ -2,18 +2,18 @@
 
 use std::{
     collections::HashSet,
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use crate::{
-    Backend, Error, MemoryMode, PowerMode, PrecisionMode, Result, Tensor, TensorInfo,
-    runtime::RuntimeInner,
+    runtime::RuntimeInner, Backend, Error, MemoryMode, PowerMode, PrecisionMode, Result, Tensor,
+    TensorInfo,
 };
 
 macro_rules! feature_backend {
@@ -38,6 +38,7 @@ pub struct ModelInfo {
     inputs: Vec<TensorInfo>,
     outputs: Vec<TensorInfo>,
     effective_threads: Option<usize>,
+    cache_file: Option<PathBuf>,
 }
 
 impl ModelInfo {
@@ -92,6 +93,8 @@ struct ModelInner {
 pub struct RunTimings {
     /// Queue and cross-model gate wait, excluding caller-side validation/allocation.
     pub queue_wait: Duration,
+    /// Resizing native tensors and preparing the session for the request.
+    pub resize: Duration,
     /// Copying inputs into MNN (including layout conversion/upload).
     pub input_copy: Duration,
     /// Native session execution (some GPU work can finish during output copy).
@@ -154,7 +157,7 @@ impl Drop for PendingRun {
 #[derive(Debug)]
 struct RunCommand {
     inputs: Vec<(usize, Tensor)>,
-    outputs: Vec<(usize, Tensor)>,
+    outputs: Vec<(usize, Option<Tensor>)>,
     reply: mpsc::Sender<Result<InferenceOutput>>,
     cancelled: Arc<AtomicBool>,
     deadline: Option<Instant>,
@@ -179,6 +182,7 @@ impl RunCommand {
 #[derive(Debug)]
 enum Command {
     Run(RunCommand),
+    SaveCache(mpsc::Sender<Result<()>>),
     Shutdown,
 }
 
@@ -226,131 +230,157 @@ impl Model {
         &self.inner.info
     }
 
-    /// Run inference and return all graph outputs.
+    /// Persistent cache path, isolated by model and native configuration.
+    #[must_use]
+    pub fn cache_file(&self) -> Option<&Path> {
+        self.info().cache_file.as_deref()
+    }
+
+    /// Save kernel tuning data after earlier accepted requests have completed.
+    /// Without a cache directory this is a no-op. Shutdown also attempts a save.
     ///
     /// # Errors
+    /// Returns native cache I/O or worker errors.
+    pub fn save_cache(&self) -> Result<()> {
+        let (reply, result) = mpsc::channel();
+        self.inner
+            .commands
+            .send(Command::SaveCache(reply))
+            .map_err(|_| Error::WorkerStopped)?;
+        result.recv().map_err(|_| Error::WorkerStopped)?
+    }
+
+    /// Run inference, waiting for queue capacity, and return all graph outputs.
+    /// Concrete graph dimensions must match; unresolved dimensions use the input.
     ///
-    /// Returns an error for missing, duplicate, unknown, or mismatched inputs,
-    /// native inference failures, or an unavailable model worker.
+    /// # Errors
+    /// Returns validation, native inference, or worker errors.
     pub fn run(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
-        let output_names = self
-            .inner
-            .info
-            .outputs()
-            .iter()
-            .map(|tensor| tensor.name().to_owned())
-            .collect();
-        self.submit(inputs.to_vec(), output_names, None)?
-            .wait()
-            .map(|r| r.tensors)
+        self.run_owned(inputs.to_vec())
     }
 
-    /// Run inference and copy only the named graph outputs.
+    /// Run with concrete input shapes, permitting changes to graph dimensions
+    /// including a fixed batch or width. Rank must match; MNN validates the graph.
+    /// Calls wait for queue capacity. Actual output shapes belong to the returned tensors.
     ///
     /// # Errors
-    ///
-    /// Returns an error for invalid inputs or outputs, native inference
-    /// failures, or an unavailable model worker.
-    pub fn run_for_outputs(&self, inputs: &[Tensor], outputs: &[&str]) -> Result<Vec<Tensor>> {
-        let mut seen = HashSet::with_capacity(outputs.len());
-        let mut names = Vec::with_capacity(outputs.len());
-        for &name in outputs {
-            if !seen.insert(name) {
-                return Err(Error::DuplicateTensor {
-                    kind: "output",
-                    name: name.to_owned(),
-                });
-            }
-            if self.inner.info.output(name).is_none() {
-                return Err(Error::UnknownTensor {
-                    kind: "output",
-                    name: name.to_owned(),
-                });
-            }
-            names.push(name.to_owned());
-        }
-        self.submit(inputs.to_vec(), names, None)?
-            .wait()
-            .map(|r| r.tensors)
+    /// Returns validation, native resize/inference, or worker errors.
+    pub fn run_dynamic(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        self.run_dynamic_owned(inputs.to_vec())
     }
 
-    /// Transfer input ownership to the worker, avoiding a deep copy.
+    /// Move inputs into a blocking inference request.
     ///
     /// # Errors
-    /// Returns validation, queue, or inference errors.
+    /// Returns validation, native inference, or worker errors.
     pub fn run_owned(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>> {
-        self.try_submit_owned(inputs, None)?
+        self.enqueue(inputs, self.all_outputs(), None, false, true)?
             .wait()
             .map(|r| r.tensors)
     }
 
-    /// Reuse output allocations from an earlier run. The supplied outputs select
-    /// the names/order to retrieve. Input/output buffers are consumed even on error.
+    /// Move inputs into a blocking request that can resize concrete graph axes.
     ///
     /// # Errors
-    /// Returns validation, queue, or inference errors.
+    /// Returns validation, native resize/inference, or worker errors.
+    pub fn run_dynamic_owned(&self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>> {
+        self.enqueue(inputs, self.all_outputs(), None, true, true)?
+            .wait()
+            .map(|r| r.tensors)
+    }
+
+    /// Run inference and copy only the named graph outputs in the given order.
+    ///
+    /// # Errors
+    /// Returns validation, native inference, or worker errors.
+    pub fn run_for_outputs(&self, inputs: &[Tensor], outputs: &[&str]) -> Result<Vec<Tensor>> {
+        let outputs = outputs
+            .iter()
+            .map(|&name| (name.to_owned(), None))
+            .collect();
+        self.enqueue(inputs.to_vec(), outputs, None, false, true)?
+            .wait()
+            .map(|r| r.tensors)
+    }
+
+    /// Resize inputs and retrieve only the named outputs in the given order.
+    ///
+    /// # Errors
+    /// Returns validation, native resize/inference, or worker errors.
+    pub fn run_dynamic_for_outputs(
+        &self,
+        inputs: &[Tensor],
+        outputs: &[&str],
+    ) -> Result<Vec<Tensor>> {
+        let outputs = outputs
+            .iter()
+            .map(|&name| (name.to_owned(), None))
+            .collect();
+        self.enqueue(inputs.to_vec(), outputs, None, true, true)?
+            .wait()
+            .map(|r| r.tensors)
+    }
+
+    /// Reuse previous output allocations, selected by name, resizing them after
+    /// inference if necessary. Inputs may resize concrete graph axes, as with
+    /// `run_dynamic`. Buffers are consumed even on error; queue admission blocks.
+    ///
+    /// # Errors
+    /// Returns validation, native resize/inference, or worker errors.
     pub fn run_reusing(
         &self,
         inputs: Vec<Tensor>,
         outputs: Vec<Tensor>,
     ) -> Result<InferenceOutput> {
-        self.enqueue(inputs, outputs, None)?.wait()
+        let outputs = outputs
+            .into_iter()
+            .map(|t| (t.name().to_owned(), Some(t)))
+            .collect();
+        self.enqueue(inputs, outputs, None, true, true)?.wait()
     }
 
-    /// Submit without blocking on queue capacity. An optional absolute deadline
-    /// is checked before entering native inference. Dropping the returned handle
-    /// cancels queued work, which is useful for superseded camera frames.
+    /// Submit without waiting for queue capacity. Dropping the returned handle
+    /// cancels queued work. The deadline is checked before entering MNN.
     ///
     /// # Errors
-    /// Returns `QueueFull` if the request was not accepted, or validation errors.
+    /// Returns `QueueFull` if not accepted, or validation/deadline errors.
     pub fn try_submit_owned(
         &self,
         inputs: Vec<Tensor>,
         deadline: Option<Instant>,
     ) -> Result<PendingRun> {
-        let names = self
-            .info()
-            .outputs()
-            .iter()
-            .map(|t| t.name().to_owned())
-            .collect();
-        self.submit(inputs, names, deadline)
+        self.enqueue(inputs, self.all_outputs(), deadline, false, false)
     }
 
-    fn submit(
+    /// Nonblocking submission permitting concrete graph axes to resize.
+    ///
+    /// # Errors
+    /// Returns `QueueFull` if not accepted, or validation/deadline errors.
+    pub fn try_submit_dynamic_owned(
         &self,
         inputs: Vec<Tensor>,
-        names: Vec<String>,
         deadline: Option<Instant>,
     ) -> Result<PendingRun> {
-        validate_inputs(self.info(), &inputs)?;
-        let outputs = names
-            .into_iter()
-            .map(|name| {
-                let metadata = self
-                    .info()
-                    .output(&name)
-                    .ok_or_else(|| Error::UnknownTensor {
-                        kind: "output",
-                        name: name.clone(),
-                    })?;
-                Tensor::new(
-                    name,
-                    metadata.shape().to_vec(),
-                    vec![0.0; metadata.element_count()],
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.enqueue(inputs, outputs, deadline)
+        self.enqueue(inputs, self.all_outputs(), deadline, true, false)
+    }
+
+    fn all_outputs(&self) -> Vec<(String, Option<Tensor>)> {
+        self.info()
+            .outputs()
+            .iter()
+            .map(|t| (t.name().to_owned(), None))
+            .collect()
     }
 
     fn enqueue(
         &self,
         inputs: Vec<Tensor>,
-        outputs: Vec<Tensor>,
+        outputs: Vec<(String, Option<Tensor>)>,
         deadline: Option<Instant>,
+        dynamic: bool,
+        blocking: bool,
     ) -> Result<PendingRun> {
-        validate_inputs(self.info(), &inputs)?;
+        validate_inputs(self.info(), &inputs, dynamic)?;
         let inputs = inputs
             .into_iter()
             .map(|tensor| {
@@ -366,30 +396,22 @@ impl Model {
         let mut seen = HashSet::new();
         let outputs = outputs
             .into_iter()
-            .map(|tensor| {
-                if !seen.insert(tensor.name().to_owned()) {
+            .map(|(name, tensor)| {
+                if !seen.insert(name.clone()) {
                     return Err(Error::DuplicateTensor {
                         kind: "output",
-                        name: tensor.name().to_owned(),
+                        name,
                     });
                 }
                 let index = self
                     .info()
                     .outputs()
                     .iter()
-                    .position(|t| t.name() == tensor.name())
-                    .ok_or_else(|| Error::UnknownTensor {
+                    .position(|t| t.name() == name)
+                    .ok_or(Error::UnknownTensor {
                         kind: "output",
-                        name: tensor.name().to_owned(),
+                        name,
                     })?;
-                let metadata = &self.info().outputs()[index];
-                if tensor.shape() != metadata.shape() {
-                    return Err(Error::ShapeMismatch {
-                        name: tensor.name().to_owned(),
-                        expected: metadata.shape().to_vec(),
-                        actual: tensor.shape().to_vec(),
-                    });
-                }
                 Ok((index, tensor))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -404,13 +426,20 @@ impl Model {
             submitted: Instant::now(),
         };
         command.check_live()?;
-        self.inner
-            .commands
-            .try_send(Command::Run(command))
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => Error::QueueFull,
-                mpsc::TrySendError::Disconnected(_) => Error::WorkerStopped,
-            })?;
+        if blocking {
+            self.inner
+                .commands
+                .send(Command::Run(command))
+                .map_err(|_| Error::WorkerStopped)?;
+        } else {
+            self.inner
+                .commands
+                .try_send(Command::Run(command))
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => Error::QueueFull,
+                    mpsc::TrySendError::Disconnected(_) => Error::WorkerStopped,
+                })?;
+        }
         Ok(PendingRun { result, cancelled })
     }
 }
@@ -425,7 +454,7 @@ impl Drop for ModelInner {
     }
 }
 
-fn validate_inputs(info: &ModelInfo, inputs: &[Tensor]) -> Result<()> {
+fn validate_inputs(info: &ModelInfo, inputs: &[Tensor], dynamic: bool) -> Result<()> {
     let mut seen = HashSet::with_capacity(inputs.len());
     for input in inputs {
         if !seen.insert(input.name()) {
@@ -440,7 +469,14 @@ fn validate_inputs(info: &ModelInfo, inputs: &[Tensor]) -> Result<()> {
                 kind: "input",
                 name: input.name().to_owned(),
             })?;
-        if expected.shape() != input.shape() {
+        if expected.shape().len() != input.shape().len()
+            || (!dynamic
+                && expected
+                    .shape()
+                    .iter()
+                    .zip(input.shape())
+                    .any(|(&e, &a)| e > 0 && usize::try_from(e).ok() != Some(a)))
+        {
             return Err(Error::ShapeMismatch {
                 name: input.name().to_owned(),
                 expected: expected.shape().to_vec(),
@@ -491,6 +527,14 @@ fn worker_main(
                 });
                 let _ = request.reply.send(result);
             }
+            Command::SaveCache(reply) => {
+                let result = with_gate(runtime, || {
+                    engine
+                        .save_cache()
+                        .map_err(|e| native_error("save cache", &e))
+                });
+                let _ = reply.send(result);
+            }
             Command::Shutdown => break,
         }
     }
@@ -500,6 +544,7 @@ fn worker_main(
         gate.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
+    let _ = engine.save_cache();
     drop(engine);
 }
 
@@ -525,7 +570,8 @@ fn initialize_model(
         memory: mnn_memory(runtime.config.memory),
         gpu_mode: gpu_mode(&runtime.config)?,
     };
-    let engine = mnn_runtime_sys::Engine::new(model, config)
+    let cache_file = cache_file(model, runtime)?;
+    let engine = mnn_runtime_sys::Engine::new_with_cache_file(model, config, cache_file.as_deref())
         .map_err(|error| native_error("create engine", &error))?;
     let effective_threads = engine.effective_threads();
     if let Some(effective) = effective_threads {
@@ -565,6 +611,7 @@ fn initialize_model(
             inputs,
             outputs,
             effective_threads,
+            cache_file,
         },
     ))
 }
@@ -577,16 +624,7 @@ fn collect_tensors(tensors: Vec<mnn_runtime_sys::TensorInfo>) -> Result<Vec<Tens
 }
 
 fn tensor_info(name: String, shape: &[i32], channel_last: bool) -> Result<TensorInfo> {
-    let shape = shape
-        .iter()
-        .map(|&dimension| {
-            usize::try_from(dimension)
-                .ok()
-                .filter(|&dimension| dimension > 0)
-                .ok_or_else(|| Error::DynamicShapeUnsupported { name: name.clone() })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    TensorInfo::checked(name, shape, channel_last)
+    TensorInfo::checked(name, shape.to_vec(), channel_last)
 }
 
 fn run_model(
@@ -598,6 +636,31 @@ fn run_model(
         ..RunTimings::default()
     };
     let start = Instant::now();
+    let shapes = request
+        .inputs
+        .iter()
+        .map(|(index, tensor)| {
+            let shape = tensor
+                .shape()
+                .iter()
+                .map(|&d| {
+                    i32::try_from(d).map_err(|_| Error::ShapeOverflow {
+                        name: tensor.name().to_owned(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((*index, shape))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let shapes = shapes
+        .iter()
+        .map(|(index, shape)| (*index, shape.as_slice()))
+        .collect::<Vec<_>>();
+    engine
+        .resize_inputs(&shapes)
+        .map_err(|e| native_error("resize inputs", &e))?;
+    timings.resize = start.elapsed();
+    let start = Instant::now();
     for (index, input) in &request.inputs {
         engine
             .write_input_index(*index, input.data())
@@ -608,17 +671,59 @@ fn run_model(
     engine.run().map_err(|e| native_error("run session", &e))?;
     timings.inference = start.elapsed();
     let start = Instant::now();
-    for (index, output) in &mut request.outputs {
+    let metadata = collect_tensors(
+        engine
+            .outputs()
+            .map_err(|e| native_error("inspect outputs after inference", &e))?,
+    )?;
+    let mut tensors = Vec::with_capacity(request.outputs.len());
+    for (index, buffer) in &mut request.outputs {
+        let info = &metadata[*index];
+        let shape = info.concrete_shape()?;
+        let mut output = if let Some(mut output) = buffer.take() {
+            output.resize_output(shape)?;
+            output
+        } else {
+            let count = info.element_count().ok_or_else(|| Error::UnresolvedShape {
+                name: info.name().to_owned(),
+            })?;
+            Tensor::new(info.name(), shape, vec![0.0; count])?
+        };
         engine
             .read_output_index(*index, output.data_mut())
             .map_err(|e| native_error("copy output tensor", &e))?;
+        tensors.push(output);
     }
     timings.output_copy = start.elapsed();
-    let tensors = std::mem::take(&mut request.outputs)
-        .into_iter()
-        .map(|(_, tensor)| tensor)
-        .collect();
     Ok(InferenceOutput { tensors, timings })
+}
+
+fn cache_file(model: &[u8], runtime: &RuntimeInner) -> Result<Option<PathBuf>> {
+    use sha2::{Digest, Sha256};
+    let Some(directory) = &runtime.config.gpu_cache_dir else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(directory).map_err(|source| Error::CacheDirectory {
+        path: directory.clone(),
+        source,
+    })?;
+    let mut hash = Sha256::new();
+    hash.update(model);
+    // Exclude the directory/queue policy, which cannot affect compiled kernels.
+    let config = &runtime.config;
+    hash.update(format!(
+        "mnn-runtime-cache-v1:{}:{}:{}:{:?}:{:?}:{:?}:{}",
+        mnn_runtime_sys::version(),
+        config.backend.as_str(),
+        config.threads,
+        config.precision,
+        config.power,
+        config.memory,
+        gpu_mode(config)?
+    ));
+    Ok(Some(
+        directory.join(format!("{:x}.mnncache", hash.finalize())),
+    ))
 }
 
 pub(crate) fn gpu_mode(config: &crate::RuntimeConfig) -> Result<i32> {
@@ -667,6 +772,7 @@ fn mnn_backend(backend: Backend) -> Result<mnn_runtime_sys::Backend> {
         Backend::OpenCl => feature_backend!("opencl", mnn_runtime_sys::Backend::OpenCl),
         Backend::OpenGl => feature_backend!("opengl", mnn_runtime_sys::Backend::OpenGl),
         Backend::Vulkan => feature_backend!("vulkan", mnn_runtime_sys::Backend::Vulkan),
+        Backend::Cuda => feature_backend!("cuda", mnn_runtime_sys::Backend::Cuda),
     }
 }
 
@@ -714,6 +820,7 @@ mod tests {
             ],
             outputs: vec![TensorInfo::new("gaze_vector".to_owned(), vec![1, 3])],
             effective_threads: Some(4),
+            cache_file: None,
         }
     }
 
@@ -724,12 +831,12 @@ mod tests {
     #[test]
     fn named_inputs_may_arrive_in_any_order() {
         let inputs = [input("right_eye"), input("left_eye")];
-        validate_inputs(&two_input_model(), &inputs).expect("both named inputs are present");
+        validate_inputs(&two_input_model(), &inputs, false).expect("both named inputs are present");
     }
 
     #[test]
     fn missing_named_input_is_rejected() {
-        let error = validate_inputs(&two_input_model(), &[input("left_eye")])
+        let error = validate_inputs(&two_input_model(), &[input("left_eye")], false)
             .expect_err("right eye is required");
         assert!(matches!(error, Error::MissingInput(name) if name == "right_eye"));
     }
@@ -737,7 +844,7 @@ mod tests {
     #[test]
     fn duplicate_named_input_is_rejected() {
         let inputs = [input("left_eye"), input("left_eye"), input("right_eye")];
-        let error = validate_inputs(&two_input_model(), &inputs)
+        let error = validate_inputs(&two_input_model(), &inputs, false)
             .expect_err("duplicate left eye must be rejected");
         assert!(matches!(
             error,

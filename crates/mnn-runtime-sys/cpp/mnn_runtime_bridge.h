@@ -17,6 +17,7 @@ typedef struct MnnRuntimeConfig {
     int32_t power;
     int32_t memory;
     int32_t gpu_mode;
+    const char *cache_file;
 } MnnRuntimeConfig;
 
 enum MnnRuntimeStatus {
@@ -59,6 +60,19 @@ int32_t mnn_runtime_tensor_shape(
     size_t index,
     int32_t *dimensions,
     size_t capacity);
+
+typedef struct MnnRuntimeInputShape {
+    size_t index;
+    const int32_t *dimensions;
+    size_t rank;
+} MnnRuntimeInputShape;
+
+/* Validate all input shapes before resizing any tensor. */
+int32_t mnn_runtime_resize_inputs(
+    MnnRuntimeEngine *engine,
+    const MnnRuntimeInputShape *shapes,
+    size_t count);
+int32_t mnn_runtime_save_cache(MnnRuntimeEngine *engine);
 
 int32_t mnn_runtime_write_input_index_f32(
     MnnRuntimeEngine *engine,

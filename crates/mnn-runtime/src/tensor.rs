@@ -2,32 +2,31 @@
 
 use crate::{Error, Result};
 
-/// Static model tensor metadata.
+/// Model tensor metadata at load time. Nonpositive dimensions are unresolved.
+/// Use returned `Tensor` shapes for the actual dimensions of a particular run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorInfo {
     name: String,
-    shape: Vec<usize>,
-    element_count: usize,
+    shape: Vec<i32>,
     channel_last: bool,
 }
 
 impl TensorInfo {
-    pub(crate) fn checked(name: String, shape: Vec<usize>, channel_last: bool) -> Result<Self> {
-        let element_count = shape
-            .iter()
-            .try_fold(1_usize, |n, &d| n.checked_mul(d))
-            .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<f32>())
-            .ok_or_else(|| Error::ShapeOverflow { name: name.clone() })?;
-        Ok(Self {
+    pub(crate) fn checked(name: String, shape: Vec<i32>, channel_last: bool) -> Result<Self> {
+        let info = Self {
             name,
             shape,
-            element_count,
             channel_last,
-        })
+        };
+        if !info.is_dynamic() {
+            let shape = info.concrete_shape()?;
+            checked_elements(info.name(), &shape)?;
+        }
+        Ok(info)
     }
 
     #[cfg(test)]
-    pub(crate) fn new(name: String, shape: Vec<usize>) -> Self {
+    pub(crate) fn new(name: String, shape: Vec<i32>) -> Self {
         Self::checked(name, shape, false).expect("test tensor shape")
     }
 
@@ -43,17 +42,61 @@ impl TensorInfo {
         &self.name
     }
 
-    /// Tensor dimensions.
+    /// Signed graph dimensions. Nonpositive dimensions require concrete inputs.
+    /// An output awaiting its first resize is represented by `[-1]`.
     #[must_use]
-    pub fn shape(&self) -> &[usize] {
+    pub fn shape(&self) -> &[i32] {
         &self.shape
     }
 
-    /// Number of `f32` elements in the tensor.
+    /// Whether one or more dimensions are unresolved.
     #[must_use]
-    pub fn element_count(&self) -> usize {
-        self.element_count
+    pub fn is_dynamic(&self) -> bool {
+        self.shape.iter().any(|&d| d <= 0)
     }
+
+    /// Concrete dimensions, when known.
+    ///
+    /// # Errors
+    /// Returns `UnresolvedShape` if dimensions still depend on the input.
+    pub fn concrete_shape(&self) -> Result<Vec<usize>> {
+        self.shape
+            .iter()
+            .map(|&d| {
+                usize::try_from(d)
+                    .ok()
+                    .filter(|&d| d > 0)
+                    .ok_or_else(|| Error::UnresolvedShape {
+                        name: self.name.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Number of f32 elements, or `None` until all dimensions are known.
+    #[must_use]
+    pub fn element_count(&self) -> Option<usize> {
+        self.concrete_shape()
+            .ok()
+            .and_then(|shape| checked_elements(&self.name, &shape).ok())
+    }
+}
+
+// MNN uses signed int sizes. Reserve headroom for packed channels (NC4HW4).
+fn checked_elements(name: &str, shape: &[usize]) -> Result<usize> {
+    if shape.len() > 8 || shape.contains(&0) {
+        return Err(Error::InvalidShape {
+            name: name.to_owned(),
+            shape: shape.to_vec(),
+        });
+    }
+    shape
+        .iter()
+        .try_fold(1_usize, |n, &d| n.checked_mul(d))
+        .filter(|&n| n <= i32::MAX as usize / std::mem::size_of::<f32>() / 4)
+        .ok_or_else(|| Error::ShapeOverflow {
+            name: name.to_owned(),
+        })
 }
 
 /// Owned `f32` tensor passed to or returned from a model.
@@ -69,8 +112,8 @@ impl Tensor {
     ///
     /// # Errors
     ///
-    /// Returns an error when the shape overflows `usize` or its element count
-    /// differs from the supplied data length.
+    /// Returns an error for zero dimensions, rank above eight, shapes exceeding
+    /// native allocation limits, or data length differing from the element count.
     pub fn new(
         name: impl Into<String>,
         shape: impl Into<Vec<usize>>,
@@ -79,10 +122,7 @@ impl Tensor {
         let name = name.into();
         let shape = shape.into();
         let data = data.into();
-        let expected = shape
-            .iter()
-            .try_fold(1_usize, |size, &dimension| size.checked_mul(dimension))
-            .ok_or_else(|| Error::ShapeOverflow { name: name.clone() })?;
+        let expected = checked_elements(&name, &shape)?;
         if expected != data.len() {
             return Err(Error::DataLengthMismatch {
                 name,
@@ -91,6 +131,13 @@ impl Tensor {
             });
         }
         Ok(Self { name, shape, data })
+    }
+
+    pub(crate) fn resize_output(&mut self, shape: Vec<usize>) -> Result<()> {
+        let count = checked_elements(&self.name, &shape)?;
+        self.data.resize(count, 0.0);
+        self.shape = shape;
+        Ok(())
     }
 
     /// Tensor name.

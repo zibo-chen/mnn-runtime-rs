@@ -1,6 +1,8 @@
 [package]
 name = "mnn-runtime-sys"
 description = "A publishable native MNN bridge with verified prebuilt binaries"
+keywords = ["mnn", "inference", "machine-learning", "ffi"]
+categories = ["computer-vision", "external-ffi-bindings"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +13,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/mnn-runtime-sys"
 links = "mnn"
 readme = "README.md"
-include = ["Cargo.toml", "LICENSE", "build.rs", "build_support.rs", "README.md", "src/**", "cpp/**", "tests/**"]
+include = ["Cargo.toml", "LICENSE", "build.rs", "build_support.rs", "prebuilt.rs", "README.md", "src/**", "cpp/**", "tests/**"]
 
 [features]
 default = ["prebuilt", "static", "mnn-threadpool"]
@@ -25,6 +27,8 @@ coreml = ["metal"]
 opencl = []
 opengl = []
 vulkan = []
+cuda = []
+static-cpp-runtime = []
 openmp = []
 crt-static = []
 
@@ -34,7 +38,7 @@ cmake = "0.1"
 flate2 = "1.0"
 sha2 = "0.10"
 tar = "0.4"
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
 [package.metadata.docs.rs]
 all-features = false

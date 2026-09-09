@@ -32,22 +32,24 @@ error instead of exposing a dangling session.
 
 - A runtime is a configuration factory; each loaded model owns one worker thread.
 - A model contains at least one input and one output.
-- Every graph tensor exposed by the safe API is static-shape `f32`.
+- Every concrete tensor exposed by the safe API is `f32`; load metadata may contain unresolved dimensions.
 - Each inference call supplies every input exactly once.
 - Requested outputs are known and unique.
 - Tensor shape and element count are checked before native calls.
 - Serialized runtimes share the gate owned by the unique sys crate, including across high-level crate versions.
 - Creation, inference and destruction participate in that gate; explicit Parallel runtimes opt out.
-- Model bytes are released after native initialization; host buffers survive across requests.
-- Admission is bounded and expired/cancelled requests are checked again after acquiring the gate.
+- Rust model bytes are released after native initialization; native model bytes remain for resizing. Host buffers are lazy and follow shape/layout changes.
+- Admission is bounded: synchronous calls wait, try-submit calls can fail with QueueFull. Expired/cancelled requests are checked again after acquiring the gate.
+- All input shapes are validated before a resize transaction; all input copies occur after resize.
+- Output tensors are allocated only after inference, using the current native shapes.
+- Cache loading, explicit saves, and best-effort shutdown saves run on the native worker under the same execution policy.
 
 ## Planned extensions
 
-1. Dynamic input resizing with per-request shape validation.
-2. Typed `f16`, integer, and quantized tensors.
-3. Fair, workload-aware scheduling across models and a nonblocking Future adapter.
-4. Promote checksummed prebuilt native artifacts from `dev` to immutable tags.
-5. Hardware-specific allocation/RSS/throughput baselines using the exposed stage timings.
+1. Typed `f16`, integer, and quantized tensors.
+2. Fair, workload-aware scheduling across models and a nonblocking Future adapter.
+3. Pin versioned native releases and record every backend profile's checksum.
+4. Hardware-specific allocation/RSS/throughput baselines using the exposed stage timings.
 
 ## Scheduler decision
 

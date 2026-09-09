@@ -19,6 +19,8 @@ pub enum Backend {
     OpenGl,
     /// Vulkan.
     Vulkan,
+    /// NVIDIA CUDA.
+    Cuda,
 }
 
 impl Backend {
@@ -33,6 +35,7 @@ impl Backend {
             Self::OpenCl => "opencl",
             Self::OpenGl => "opengl",
             Self::Vulkan => "vulkan",
+            Self::Cuda => "cuda",
         }
     }
 }
@@ -139,6 +142,9 @@ pub struct RuntimeConfig {
     pub gpu_tuning: GpuTuning,
     /// `OpenCL` storage policy.
     pub gpu_memory: GpuMemoryMode,
+    /// Directory for caches isolated by model, native version and configuration.
+    /// Cache writes occur on `Model::save_cache` and worker shutdown.
+    pub gpu_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for RuntimeConfig {
@@ -153,6 +159,7 @@ impl Default for RuntimeConfig {
             queue_capacity: 2,
             gpu_tuning: GpuTuning::Auto,
             gpu_memory: GpuMemoryMode::Buffer,
+            gpu_cache_dir: None,
         }
     }
 }
@@ -203,6 +210,13 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn with_gpu_memory(mut self, memory: GpuMemoryMode) -> Self {
         self.gpu_memory = memory;
+        self
+    }
+
+    /// Enable persistent kernel caches for subsequently loaded models.
+    #[must_use]
+    pub fn with_gpu_cache_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.gpu_cache_dir = Some(directory.into());
         self
     }
 

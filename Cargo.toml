@@ -7,9 +7,9 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-authors = ["Chen Zibo"]
+edition = "2021"
+rust-version = "1.75"
+authors = ["ChenZibo <qw.54@163.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/zibo-chen/mnn-runtime-rs"
 homepage = "https://github.com/zibo-chen/mnn-runtime-rs"

@@ -17,6 +17,7 @@ fn main() -> ExitCode {
             Ok("opencl") => Backend::OpenCl,
             Ok("opengl") => Backend::OpenGl,
             Ok("vulkan") => Backend::Vulkan,
+            Ok("cuda") => Backend::Cuda,
             Ok("auto") => Backend::Auto,
             Ok(_) | Err(_) => Backend::Cpu,
         };
@@ -29,8 +30,15 @@ fn main() -> ExitCode {
             .map(|info| {
                 Tensor::new(
                     info.name(),
-                    info.shape().to_vec(),
-                    vec![0.0; info.element_count()],
+                    info.concrete_shape()?,
+                    vec![
+                        0.0;
+                        info.element_count().ok_or_else(|| {
+                            mnn_runtime::Error::UnresolvedShape {
+                                name: info.name().to_owned(),
+                            }
+                        })?
+                    ],
                 )
             })
             .collect::<mnn_runtime::Result<Vec<_>>>()?;

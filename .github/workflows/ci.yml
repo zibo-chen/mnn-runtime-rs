@@ -2,46 +2,67 @@ name: CI
 
 on:
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - name: Check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
       - name: Clippy
         if: runner.os == 'Linux'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
-      - name: Package native crate
-        if: runner.os == 'Linux'
-        run: cargo package -p mnn-runtime-sys
+        run: cargo test --workspace --locked
 
-  msrv:
-    runs-on: macos-latest
+  package:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - run: cargo check --workspace --all-targets
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check release metadata
+        run: python3 scripts/check_release.py
+      - name: Verify both crates without publishing
+        run: cargo publish --workspace --dry-run --locked
+      - name: Build docs.rs documentation without native downloads
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          DOCS_RS: '1'
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
 
   native-modes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -52,4 +73,96 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.features }}
       - run: cargo test -p mnn-runtime --no-default-features --features '${{ matrix.features }}' --locked
+
+  prebuilt:
+    name: Prebuilt ${{ matrix.target }} (${{ matrix.features || 'base' }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, features: '' }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, features: 'vulkan,opencl', backend: vulkan }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, features: cuda }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, features: '' }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, features: 'vulkan,opencl' }
+          - { runner: macos-15, target: aarch64-apple-darwin, features: metal }
+          - { runner: macos-15, target: aarch64-apple-darwin, features: coreml }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, features: metal }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, features: coreml }
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc, features: '', msvc: x64 }
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc, features: 'vulkan,opencl', msvc: x64 }
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc, features: cuda, msvc: x64 }
+          - { runner: windows-2022, target: i686-pc-windows-msvc, features: '', msvc: x86 }
+          - { runner: windows-2022, target: i686-pc-windows-msvc, features: 'vulkan,opencl', msvc: x86 }
+          - { runner: windows-2022, target: aarch64-pc-windows-msvc, features: '', msvc: amd64_arm64 }
+          - { runner: windows-2022, target: aarch64-pc-windows-msvc, features: 'vulkan,opencl', msvc: amd64_arm64 }
+          - { runner: macos-15, target: aarch64-apple-ios, features: metal }
+          - { runner: macos-15, target: aarch64-apple-ios, features: coreml }
+          - { runner: macos-15, target: aarch64-apple-ios-sim, features: metal }
+          - { runner: macos-15, target: aarch64-apple-ios-sim, features: coreml }
+          - { runner: ubuntu-24.04, target: aarch64-linux-android, features: '' }
+          - { runner: ubuntu-24.04, target: aarch64-linux-android, features: 'vulkan,opencl,opengl' }
+          - { runner: ubuntu-24.04, target: armv7-linux-androideabi, features: '' }
+          - { runner: ubuntu-24.04, target: armv7-linux-androideabi, features: 'vulkan,opencl,opengl' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.msvc }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: prebuilt-${{ matrix.target }}-${{ matrix.features }}
+      - name: Install CUDA 12.8 (Linux)
+        if: matrix.features == 'cuda' && runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+      - name: Install CUDA 12.8 (Windows)
+        if: matrix.features == 'cuda' && runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+      - name: Install software Vulkan device
+        if: matrix.backend == 'vulkan'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+            if [ -f "$icd" ]; then
+              echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+      - name: Install Android NDK r27c
+        if: contains(matrix.target, 'android')
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'ndk;27.2.12479018'
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Verify prebuilt static/shared consumers
+        shell: bash
+        run: |
+          args=(--target "$BUILD_TARGET" --features "$BUILD_FEATURES")
+          if [ -n "$TEST_BACKEND" ]; then args+=(--backend "$TEST_BACKEND"); fi
+          python scripts/ci_prebuilt.py "${args[@]}"
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_FEATURES: ${{ matrix.features }}
+          TEST_BACKEND: ${{ matrix.backend }}

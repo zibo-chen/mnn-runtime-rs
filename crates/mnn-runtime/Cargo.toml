@@ -26,12 +26,15 @@ coreml = ["metal", "mnn-runtime-sys/coreml"]
 opencl = ["mnn-runtime-sys/opencl"]
 opengl = ["mnn-runtime-sys/opengl"]
 vulkan = ["mnn-runtime-sys/vulkan"]
+cuda = ["mnn-runtime-sys/cuda"]
+static-cpp-runtime = ["mnn-runtime-sys/static-cpp-runtime"]
 openmp = ["mnn-runtime-sys/openmp"]
 crt-static = ["mnn-runtime-sys/crt-static"]
 
 [dependencies]
 mnn-runtime-sys = { path = "../mnn-runtime-sys", version = "0.1.0", default-features = false }
 thiserror.workspace = true
+sha2 = "0.10"
 
 [package.metadata.docs.rs]
 all-features = false

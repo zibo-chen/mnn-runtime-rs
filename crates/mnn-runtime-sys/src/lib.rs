@@ -5,7 +5,11 @@
 
 #![allow(unsafe_code)]
 
-use std::{ffi::CStr, ptr::NonNull};
+use std::{
+    ffi::{CStr, CString},
+    path::Path,
+    ptr::NonNull,
+};
 
 /// The pinned Rust ABI crate version.
 pub const MNN_SYS_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -100,6 +104,28 @@ pub struct Engine {
 impl Engine {
     /// Create an engine from a model buffer.
     pub fn new(model: &[u8], config: Config) -> Result<Self, NativeError> {
+        Self::new_with_cache_file(model, config, None)
+    }
+
+    /// Create an engine with a persistent kernel cache loaded before session creation.
+    /// The parent directory must already exist; no cache is used when `None`.
+    pub fn new_with_cache_file(
+        model: &[u8],
+        config: Config,
+        cache_file: Option<&Path>,
+    ) -> Result<Self, NativeError> {
+        let cache_file = cache_file
+            .map(|path| {
+                let path = path.to_str().ok_or_else(|| NativeError {
+                    status: Some(1),
+                    message: "cache path must be valid UTF-8".to_owned(),
+                })?;
+                CString::new(path).map_err(|_| NativeError {
+                    status: Some(1),
+                    message: "cache path contains a NUL byte".to_owned(),
+                })
+            })
+            .transpose()?;
         let native_config = ffi::MnnRuntimeConfig {
             backend: config.backend as i32,
             threads: config.threads,
@@ -107,13 +133,10 @@ impl Engine {
             power: config.power,
             memory: config.memory,
             gpu_mode: config.gpu_mode,
+            cache_file: cache_file.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
         };
         let pointer = unsafe {
-            ffi::mnn_runtime_engine_create(
-                model.as_ptr().cast(),
-                model.len(),
-                &raw const native_config,
-            )
+            ffi::mnn_runtime_engine_create(model.as_ptr().cast(), model.len(), &native_config)
         };
         NonNull::new(pointer)
             .map(|pointer| Self { pointer })
@@ -159,6 +182,30 @@ impl Engine {
                 data.len(),
             )
         };
+        self.check(status)
+    }
+
+    /// Resize every input in one transaction. Entries are `(input_index, shape)`.
+    /// All entries are checked before changing native tensors; native resize
+    /// failures leave the session requiring another successful resize.
+    pub fn resize_inputs(&mut self, shapes: &[(usize, &[i32])]) -> Result<(), NativeError> {
+        let shapes: Vec<_> = shapes
+            .iter()
+            .map(|(index, dimensions)| ffi::MnnRuntimeInputShape {
+                index: *index,
+                dimensions: dimensions.as_ptr(),
+                rank: dimensions.len(),
+            })
+            .collect();
+        let status = unsafe {
+            ffi::mnn_runtime_resize_inputs(self.pointer.as_ptr(), shapes.as_ptr(), shapes.len())
+        };
+        self.check(status)
+    }
+
+    /// Persist kernel tuning data. A model without a configured cache is a no-op.
+    pub fn save_cache(&mut self) -> Result<(), NativeError> {
+        let status = unsafe { ffi::mnn_runtime_save_cache(self.pointer.as_ptr()) };
         self.check(status)
     }
 
@@ -292,9 +339,23 @@ mod ffi {
         pub power: i32,
         pub memory: i32,
         pub gpu_mode: i32,
+        pub cache_file: *const c_char,
     }
 
-    unsafe extern "C" {
+    #[repr(C)]
+    pub struct MnnRuntimeInputShape {
+        pub index: usize,
+        pub dimensions: *const i32,
+        pub rank: usize,
+    }
+
+    extern "C" {
+        pub fn mnn_runtime_resize_inputs(
+            engine: *mut MnnRuntimeEngine,
+            shapes: *const MnnRuntimeInputShape,
+            count: usize,
+        ) -> i32;
+        pub fn mnn_runtime_save_cache(engine: *mut MnnRuntimeEngine) -> i32;
         pub fn mnn_runtime_version() -> *const c_char;
         pub fn mnn_runtime_backend_available(backend: i32) -> i32;
         pub fn mnn_runtime_engine_create(
