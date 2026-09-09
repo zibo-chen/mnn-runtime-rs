@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/mnn-runtime",
+    "crates/mnn-runtime-sys",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Chen Zibo"]
+license = "Apache-2.0"
+repository = "https://github.com/zibo-chen/mnn-runtime-rs"
+homepage = "https://github.com/zibo-chen/mnn-runtime-rs"
+
+[workspace.dependencies]
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

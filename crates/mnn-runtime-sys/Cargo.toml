@@ -1,0 +1,41 @@
+[package]
+name = "mnn-runtime-sys"
+description = "A publishable native MNN bridge with verified prebuilt binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/mnn-runtime-sys"
+links = "mnn"
+readme = "README.md"
+include = ["Cargo.toml", "LICENSE", "build.rs", "README.md", "src/**", "cpp/**"]
+
+[features]
+default = ["prebuilt", "static", "mnn-threadpool"]
+prebuilt = []
+build-from-source = []
+static = []
+dynamic = []
+mnn-threadpool = []
+metal = []
+coreml = []
+opencl = []
+opengl = []
+vulkan = []
+openmp = []
+crt-static = []
+
+[build-dependencies]
+cc = "1.2"
+cmake = "0.1"
+flate2 = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[package.metadata.docs.rs]
+all-features = false
+targets = ["x86_64-unknown-linux-gnu"]

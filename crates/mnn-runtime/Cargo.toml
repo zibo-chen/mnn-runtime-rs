@@ -1,0 +1,49 @@
+[package]
+name = "mnn-runtime"
+description = "A safe, process-friendly Rust runtime for MNN inference"
+keywords = ["mnn", "inference", "machine-learning", "computer-vision"]
+categories = ["computer-vision", "api-bindings"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/mnn-runtime"
+readme = "README.md"
+include = ["Cargo.toml", "LICENSE", "README.md", "src/**", "examples/**"]
+
+[features]
+default = ["prebuilt", "static", "mnn-threadpool"]
+prebuilt = ["mnn-runtime-sys/prebuilt"]
+build-from-source = ["mnn-runtime-sys/build-from-source"]
+static = ["mnn-runtime-sys/static"]
+dynamic = ["mnn-runtime-sys/dynamic"]
+mnn-threadpool = ["mnn-runtime-sys/mnn-threadpool"]
+metal = ["mnn-runtime-sys/metal"]
+coreml = ["mnn-runtime-sys/coreml"]
+opencl = ["mnn-runtime-sys/opencl"]
+opengl = ["mnn-runtime-sys/opengl"]
+vulkan = ["mnn-runtime-sys/vulkan"]
+openmp = ["mnn-runtime-sys/openmp"]
+crt-static = ["mnn-runtime-sys/crt-static"]
+
+[dependencies]
+mnn-runtime-sys = { path = "../mnn-runtime-sys", version = "0.1.0", default-features = false }
+thiserror.workspace = true
+
+[package.metadata.docs.rs]
+all-features = false
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lints]
+workspace = true
+
+[[example]]
+name = "inspect"
+path = "examples/inspect.rs"
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
