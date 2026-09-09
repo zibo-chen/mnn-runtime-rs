@@ -407,6 +407,24 @@ fn link_mnn(
     mode: LinkMode,
     prebuilt: Option<&PrebuiltArtifact>,
 ) {
+    // Both CUDA companions have the same filename. Search the static variant
+    // before lib/ so the linker and Cargo's test loader cannot pick the shared
+    // MNN companion when consuming libMNN.a.
+    if let Some(library) = cuda_side_library(os, cfg!(feature = "cuda")) {
+        let companion = if mode == LinkMode::Static
+            && (prebuilt.is_some() || lib.join("cuda-static").is_dir())
+        {
+            lib.join("cuda-static")
+        } else {
+            lib.to_owned()
+        };
+        assert!(
+            companion.join(format!("lib{library}.so")).is_file(),
+            "CUDA companion lib{library}.so is missing from {}",
+            companion.display()
+        );
+        println!("cargo:rustc-link-search=native={}", companion.display());
+    }
     println!("cargo:rustc-link-search=native={}", lib.display());
     let whole_archive = prebuilt.is_some()
         || cfg!(feature = "cuda")
@@ -486,19 +504,6 @@ fn link_mnn(
             }
         }
         if let Some(library) = cuda_side_library(os, true) {
-            let companion = if mode == LinkMode::Static
-                && (prebuilt.is_some() || lib.join("cuda-static").is_dir())
-            {
-                lib.join("cuda-static")
-            } else {
-                lib.to_owned()
-            };
-            assert!(
-                companion.join(format!("lib{library}.so")).is_file(),
-                "CUDA companion lib{library}.so is missing from {}",
-                companion.display()
-            );
-            println!("cargo:rustc-link-search=native={}", companion.display());
             println!("cargo:rustc-link-lib=dylib={library}");
         }
         println!("cargo:rustc-link-lib=dylib=cudart");
