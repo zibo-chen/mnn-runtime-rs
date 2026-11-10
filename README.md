@@ -317,7 +317,8 @@ packages. Preserve OCR's public configuration/enums/error types in its adapter.
 
 CUDA source builds set `MNN_CUDA=ON`; compatible requests use CUDA 12 prebuilts.
 Use `CUDA_TOOLKIT_ROOT_DIR`, `CUDA_PATH` or `CUDA_HOME` for the toolkit, and
-optionally `MNN_CUDA_ARCHS` for CMake's `CUDA_ARCHS`. Linux installs/links
+optionally `MNN_CUDA_ARCHS` for CMake's `CUDA_ARCHS`. Source builds also require
+cuSOLVER and NVRTC development headers. Linux installs/links
 `libMNN_Cuda_Main.so` even when MNN itself is static. Prebuilt static MNN uses
 `lib/cuda-static/libMNN_Cuda_Main.so`; dynamic MNN uses the copy in `lib/`.
 Ship the matching side library and

@@ -98,7 +98,8 @@ jobs:
         with:
           cuda: '12.8.1'
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+          # Source headers also include cuSOLVER and NVRTC declarations.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cusolver_dev", "cusparse_dev", "nvrtc_dev", "curand_dev", "thrust"]'
       - name: Test source build from a deep Cargo target directory
         shell: pwsh
         run: |
