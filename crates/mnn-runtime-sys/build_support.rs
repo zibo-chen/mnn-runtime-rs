@@ -1,3 +1,44 @@
+use std::{
+    collections::hash_map::DefaultHasher,
+    ffi::OsString,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+};
+
+/// Keep native source/build paths independent of deeply nested Cargo targets.
+/// The Cargo output directory and source revision isolate concurrent builds.
+pub fn source_build_dir(
+    out_dir: &Path,
+    base: Option<&Path>,
+    temporary: &Path,
+    windows_host: bool,
+    revision: &str,
+) -> PathBuf {
+    let base = match base {
+        Some(base) => base.to_owned(),
+        None if windows_host => temporary.join("mnn"),
+        None => return out_dir.to_owned(),
+    };
+    let mut hash = DefaultHasher::new();
+    out_dir.hash(&mut hash);
+    revision.hash(&mut hash);
+    base.join(format!("{:016x}", hash.finish()))
+}
+
+/// FindCUDA embeds toolkit paths in generated CMake scripts, where backslashes
+/// can become escape sequences. Preserve native paths for filesystem access.
+pub fn cmake_path(path: &Path, windows_host: bool) -> OsString {
+    if !windows_host {
+        return path.as_os_str().to_owned();
+    }
+    let path = path.to_string_lossy().replace('\\', "/");
+    if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        format!("//{unc}").into()
+    } else {
+        path.strip_prefix("//?/").unwrap_or(&path).into()
+    }
+}
+
 pub fn target_suffix(os: &str, arch: &str, target_env: &str, target: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") if target_env == "gnu" => Some("linux-x86_64"),

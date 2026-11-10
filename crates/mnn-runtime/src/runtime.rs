@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn linked_mnn_reports_a_version() {
-        assert!(!Runtime::native_version().is_empty());
+        assert_ne!(Runtime::native_version(), "");
         assert_ne!(Runtime::native_version(), "unknown");
     }
 }

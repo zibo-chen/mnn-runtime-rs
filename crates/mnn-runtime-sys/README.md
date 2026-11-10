@@ -35,3 +35,11 @@ CUDA prebuilts require Toolkit >=12.8,<13 and external CUDA/cuBLAS runtimes.
 `static-cpp-runtime` links the
 MinGW C++/GCC/pthread archives on Windows GNU and is distinct from `crt-static`.
 See the repository README for toolkit paths and deployment requirements.
+
+Windows source builds use `%TEMP%\mnn\<build-id>` for short source and CMake
+paths. Set `MNN_BUILD_DIR` to an absolute short base directory (for example,
+`C:\mnn`) to override it on any host. Builds are isolated by Cargo output
+directory and MNN revision. `MNN_SOURCE_DIR` selects an existing tree in place;
+keep it short as well. Windows CUDA toolkit paths are converted to forward
+slashes for CMake. Relocated build directories can be removed manually after
+use; `cargo clean` does not remove them.
