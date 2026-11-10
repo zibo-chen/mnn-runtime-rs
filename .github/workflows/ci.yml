@@ -114,7 +114,7 @@ jobs:
           }
           cargo test --workspace --no-default-features --features $features --locked -j 2
         env:
-          MNN_CUDA_ARCHS: '75'
+          MNN_CUDA_ARCHS: '7.5'
 
   prebuilt:
     name: Prebuilt ${{ matrix.target }} (${{ matrix.features || 'base' }})
