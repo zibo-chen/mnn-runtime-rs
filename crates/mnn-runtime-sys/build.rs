@@ -8,7 +8,10 @@ use std::{
 
 mod build_support;
 mod prebuilt;
-use build_support::{cuda_side_library, cuda_target_supported, ios_sdk, static_cpp_libraries};
+use build_support::{
+    cmake_path, cuda_side_library, cuda_target_supported, ios_sdk, source_build_dir,
+    static_cpp_libraries,
+};
 use prebuilt::{
     select_prebuilt, PrebuiltArtifact, PrebuiltFeatures, MNN_SOURCE_REVISION, MNN_SOURCE_SHA256,
     MNN_SOURCE_VERSION, PREBUILT_REPOSITORY, PREBUILT_TAG,
@@ -38,6 +41,7 @@ fn main() {
         "MNN_PREBUILT_SHA256",
         "MNN_REQUIRE_PREBUILT",
         "MNN_SOURCE_DIR",
+        "MNN_BUILD_DIR",
         "MNN_OPENMP_LIB",
         "CUDA_PATH",
         "CUDA_HOME",
@@ -50,6 +54,11 @@ fn main() {
         "NDK_HOME",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
+    }
+    if cfg!(windows) {
+        for variable in ["TMP", "TEMP", "USERPROFILE"] {
+            println!("cargo:rerun-if-env-changed={variable}");
+        }
     }
 
     if env::var_os("DOCS_RS").is_some() {
@@ -184,9 +193,23 @@ fn acquire_prebuilt(artifact: &PrebuiltArtifact, os: &str) -> (PathBuf, PathBuf)
 }
 
 fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (PathBuf, PathBuf) {
-    let source = acquire_source();
+    let out_dir = PathBuf::from(required_env("OUT_DIR"));
+    let base = env::var_os("MNN_BUILD_DIR").map(PathBuf::from);
+    if let Some(base) = &base {
+        assert!(base.is_absolute(), "MNN_BUILD_DIR must be an absolute path");
+    }
+    let build_dir = source_build_dir(
+        &out_dir,
+        base.as_deref(),
+        &env::temp_dir(),
+        cfg!(windows),
+        MNN_SOURCE_REVISION,
+    );
+    fs::create_dir_all(&build_dir).expect("failed to create MNN source build directory");
+    let source = acquire_source(&build_dir);
     let mut config = cmake::Config::new(&source);
     config
+        .out_dir(build_dir.join("native"))
         .profile("Release")
         .define("CMAKE_POLICY_VERSION_MINIMUM", "3.10")
         .define(
@@ -266,7 +289,7 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
     );
     if cfg!(feature = "cuda") {
         if let Some(root) = cuda_root() {
-            config.define("CUDA_TOOLKIT_ROOT_DIR", root);
+            config.define("CUDA_TOOLKIT_ROOT_DIR", cmake_path(&root, cfg!(windows)));
         }
         if let Ok(architectures) = env::var("MNN_CUDA_ARCHS") {
             config.define("CUDA_ARCHS", architectures);
@@ -348,7 +371,7 @@ fn build_from_source(os: &str, arch: &str, target_env: &str, target: &str) -> (P
     (installation.join("include"), installation.join("lib"))
 }
 
-fn acquire_source() -> PathBuf {
+fn acquire_source(build_dir: &Path) -> PathBuf {
     if let Some(source) = env::var_os("MNN_SOURCE_DIR").map(PathBuf::from) {
         if source.join("CMakeLists.txt").is_file() {
             return source;
@@ -359,19 +382,53 @@ fn acquire_source() -> PathBuf {
         );
     }
 
-    let out_dir = PathBuf::from(required_env("OUT_DIR"));
-    let root = out_dir
-        .join("source")
-        .join(format!("MNN-{MNN_SOURCE_REVISION}"));
-    if root.join("CMakeLists.txt").is_file() {
+    let root = build_dir.join("src");
+    let stamp = root.join(".mnn-source-revision");
+    if root.join("CMakeLists.txt").is_file()
+        && fs::read_to_string(&stamp).ok().as_deref() == Some(MNN_SOURCE_REVISION)
+    {
         return root;
     }
-    let archive = out_dir.join(format!("MNN-{MNN_SOURCE_REVISION}.tar.gz"));
+    let archive = build_dir.join(format!("MNN-{MNN_SOURCE_REVISION}.tar.gz"));
     let url = format!("https://codeload.github.com/alibaba/MNN/tar.gz/{MNN_SOURCE_REVISION}");
     ensure_download(&url, &archive, MNN_SOURCE_SHA256);
-    let destination = out_dir.join("source");
-    fs::create_dir_all(&destination).expect("failed to create MNN source directory");
-    extract_tar_gz(&archive, &destination);
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("failed to clear partial MNN source extraction");
+    }
+    fs::create_dir_all(&root).expect("failed to create MNN source directory");
+    // Strip the archive's MNN-<40-character revision>/ prefix before extraction
+    // so even the extraction itself uses short paths on Windows.
+    let file = File::open(&archive).expect("failed to open MNN source archive");
+    let mut archive = tar::Archive::new(GzDecoder::new(BufReader::new(file)));
+    for entry in archive
+        .entries()
+        .expect("failed to read MNN source archive")
+    {
+        let mut entry = entry.expect("failed to read MNN source entry");
+        if entry.header().entry_type().is_pax_global_extensions() {
+            continue;
+        }
+        let path = entry.path().expect("invalid MNN source path").into_owned();
+        let relative = path
+            .strip_prefix(format!("MNN-{MNN_SOURCE_REVISION}"))
+            .expect("unexpected MNN source archive root");
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        assert!(
+            relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "invalid MNN source archive path"
+        );
+        let destination = root.join(relative);
+        fs::create_dir_all(destination.parent().expect("source entry has a parent"))
+            .expect("failed to create MNN source subdirectory");
+        entry
+            .unpack(destination)
+            .expect("failed to extract MNN source entry");
+    }
+    fs::write(stamp, MNN_SOURCE_REVISION).expect("failed to record MNN source revision");
     root
 }
 

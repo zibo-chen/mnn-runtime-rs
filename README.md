@@ -327,3 +327,22 @@ Source builds use the companion in `MNN_LIB_DIR`. External SDKs with a
 `MNN_LIB_DIR` directly. Windows
 CUDA requires MSVC; MinGW CUDA is not supported by this baseline. Static GPU
 archives use whole-archive linking to retain backend registrations.
+
+On Windows hosts, source builds download/extract MNN into
+`%TEMP%\mnn\<build-id>\src` and place CMake output beside it, avoiding Cargo's
+deep target paths and the archive's long revision directory. `MNN_BUILD_DIR`
+overrides the base directory on any host; it must be absolute. Each Cargo
+output directory and pinned MNN revision gets its own build ID so different
+configurations do not share a CMake cache. If your temporary directory is also
+deeply nested, use a short writable path in PowerShell:
+
+```powershell
+$env:MNN_BUILD_DIR = 'C:\mnn'
+cargo build --features build-from-source,cuda
+```
+
+`MNN_SOURCE_DIR` still selects an existing source tree without copying it;
+keep that path short too. CUDA toolkit paths may contain spaces and either
+slash style; Windows paths are normalized before being passed to CMake.
+Relocated native build directories survive `cargo clean`; remove the chosen
+base directory's build-ID subdirectories when they are no longer needed.

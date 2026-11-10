@@ -5,6 +5,61 @@ mod prebuilt;
 use build_support::{ios_sdk, target_suffix};
 
 #[test]
+fn source_build_paths_stay_short_and_isolate_cargo_outputs() {
+    use build_support::source_build_dir;
+    use std::path::Path;
+
+    let out = Path::new("project/with/a/deep/target/debug/build/mnn-runtime-sys-123/out");
+    let temporary = Path::new("temporary");
+    let windows = source_build_dir(out, None, temporary, true, "revision-a");
+    assert_eq!(windows.parent(), Some(temporary.join("mnn").as_path()));
+    assert_eq!(windows.file_name().unwrap().len(), 16);
+    assert_eq!(
+        windows,
+        source_build_dir(out, None, temporary, true, "revision-a")
+    );
+    assert_ne!(
+        windows,
+        source_build_dir(Path::new("other/out"), None, temporary, true, "revision-a")
+    );
+    assert_ne!(
+        windows,
+        source_build_dir(out, None, temporary, true, "revision-b")
+    );
+    assert_eq!(
+        source_build_dir(out, None, temporary, false, "revision-a"),
+        out
+    );
+
+    let base = Path::new("custom-short-root");
+    let custom = source_build_dir(out, Some(base), temporary, false, "revision-a");
+    assert_eq!(custom.parent(), Some(base));
+    assert_eq!(custom.file_name(), windows.file_name());
+}
+
+#[test]
+fn windows_cuda_paths_are_safe_to_embed_in_cmake_scripts() {
+    use build_support::cmake_path;
+    use std::path::Path;
+
+    for (input, expected) in [
+        (
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8",
+            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8",
+        ),
+        (r"C:/CUDA\v12.8", "C:/CUDA/v12.8"),
+        (r"\\server\share\CUDA", "//server/share/CUDA"),
+        (r"\\?\C:\CUDA\v12.8", "C:/CUDA/v12.8"),
+        (r"\\?\UNC\server\share\CUDA", "//server/share/CUDA"),
+        ("C:/工具/CUDA", "C:/工具/CUDA"),
+    ] {
+        assert_eq!(cmake_path(Path::new(input), true), expected);
+    }
+    let unix = Path::new(r"/opt/toolkit\literal");
+    assert_eq!(cmake_path(unix, false), unix.as_os_str());
+}
+
+#[test]
 fn selects_compatible_abis_only() {
     assert_eq!(
         target_suffix("linux", "x86_64", "musl", "x86_64-unknown-linux-musl"),
